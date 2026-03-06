@@ -4,9 +4,10 @@ import logging
 from typing import List, Dict, Any
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-from langchain_ollama import OllamaEmbeddings, OllamaLLM
+# from langchain_ollama import OllamaEmbeddings, OllamaLLM  <-- 可以注释掉 OllamaEmbeddings
+from langchain_ollama import OllamaLLM
+from langchain_huggingface import HuggingFaceEmbeddings  # ✅ 新增导入
 from langchain_core.documents import Document
-
 import hashlib
 
 # 配置日志
@@ -22,7 +23,7 @@ class RAGEngine:
                  db_path: str = "./chroma_db", 
                  checkpoint_path: str = "./checkpoint.json",
                  model_name: str = "qwen3", 
-                 embed_model_name: str = "nomic-embed-text"):
+                 embed_model_name: str = "bge-large-zh"): # 默认值改为 bge-large-zh
         
         self.txt_path = txt_path
         self.db_path = db_path
@@ -30,16 +31,38 @@ class RAGEngine:
         self.model_name = model_name
         self.embed_model_name = embed_model_name
         
-        # 初始化组件
-        self.embeddings = OllamaEmbeddings(model=self.embed_model_name)
+        # ✅ 修改开始：使用 HuggingFace 加载 BGE 模型
+        logger.info(f"正在加载 Embedding 模型: {self.embed_model_name} ...")
+        
+        # 为了加速国内下载，可选：设置镜像环境变量 (如果在代码外没设置)
+        # os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com' 
+        
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="BAAI/bge-large-zh",       # 指定中文大模型
+            model_kwargs={'device': 'cpu'},       # 如果有 GPU 改为 'cuda'
+            encode_kwargs={
+                'normalize_embeddings': True,     # ✅ 关键：必须归一化以计算余弦相似度
+                'batch_size': 32
+            }
+        )
+
         self.llm = OllamaLLM(model=self.model_name, temperature=0.7)
         
         # 文本分割器
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=50,
+            chunk_size=800,          # 增大到 800，容纳更多上下文
+            chunk_overlap=200,       # 增大重叠到 200，防止关键信息被切断
             length_function=len,
-            separators=["\n\n", "\n", "。", "！", "？", "；", " ", ""]
+            # 增加中文特有的分隔符优先级，尽量保持句子完整
+            separators=[
+                "\n\n",              # 段落
+                "\n",                # 换行
+                "。", "！", "？",     # 句子结束
+                "；",                # 分句
+                "，",                # 逗号
+                " ",                 # 空格
+                ""                   # 字符
+            ]
         )
         
         self.vector_store = None
@@ -164,10 +187,33 @@ class RAGEngine:
         
         logger.info("🎉 向量索引构建完成！")
 
-    def query(self, question: str, k: int = 3):
-        """执行检索增强生成 (RAG) - 改为流式生成器"""
+    
+    def query(self, question: str, k: int = 4):
+
+        """执行检索增强生成 (RAG) - 重构后的强力 Prompt 版本"""
+
+         # 【新增】查询重写 (Query Rewriting) - 让问题更具体，利于检索
+        # 只有当问题较短时才触发，或者始终触发以优化语义
+        rewrite_prompt = f"""
+        你是一个检索助手。用户将询问关于《遥远的救世主》的问题。
+        请将用户的问题改写为一个包含更多关键词、更具体、更适合向量检索的陈述句。
+        不要回答问题，只输出改写后的句子。
         
-        # --- 初始化检查 (保持不变) ---
+        用户问题: {question}
+        改写后的检索 query:
+        """
+        
+        # 这里为了简单，同步调用一次 llm.invoke (非流式)，仅用于生成检索词
+        # 注意：这会增加一点延迟，但能显著提升检索质量
+        try:
+            optimized_query = self.llm.invoke(rewrite_prompt).strip()
+            logger.info(f"[查询重写] 原始: '{question}' -> 优化: '{optimized_query}'")
+            # 使用优化后的 query 进行检索
+            search_query = optimized_query
+        except:
+            search_query = question # 失败则用原问题
+
+        # --- 初始化检查 ---
         if not self.vector_store:
             logger.warning("检测到向量库未初始化，尝试自动加载...")
             try:
@@ -179,49 +225,92 @@ class RAGEngine:
         if not self.vector_store:
             yield "❌ 错误：向量库仍未初始化。"
             return
-        # ----------------------------
 
-        # 1. 检索相关片段
-        logger.info(f"正在检索与 '{question}' 相关的上下文...")
+        # 1. 检索相关片段 (优化版)
+        logger.info(f"[规则引擎] 正在检索与 '{question}' 相关的客观事实...")
+        
+        # 方案 A: 增加 k 值，给模型更多素材去筛选
+        # 方案 B: 使用 similarity_search_with_score 查看得分，调试用
+        # 方案 C: 使用 max_marginal_relevance_search (MMR) 避免结果过于雷同
+        
         try:
-            docs = self.vector_store.similarity_search(question, k=k)
+            # ✅ 修改：使用重写后的 search_query 进行检索，而不是原始 question
+            docs = self.vector_store.max_marginal_relevance_search(
+                search_query,  # <--- 这里改为 search_query
+                k=k,               
+                fetch_k=20,        
+                lambda_mult=0.6    
+            )
         except Exception as e:
-            yield f"❌ 检索出错: {str(e)}"
-            return
+            logger.warning(f"MMR 搜索不可用，降级为普通相似度搜索: {e}")
+            # 降级时也用 search_query
+            docs = self.vector_store.similarity_search(search_query, k=k)
         
-        if not docs:
-            yield "⚠️ 未在知识库中找到相关信息，但我可以尝试根据通用知识回答："
-            # 即使没找到，也可以继续让 LLM 尝试，或者直接返回
+        # 2. 构建结构化上下文
+        context_evidence = []
+        for i, d in enumerate(docs):
+            evidence_block = f"[依据 {i+1}]:\n{d.page_content}"
+            context_evidence.append(evidence_block)
         
-        # 2. 构建上下文
-        context_text = "\n\n".join([d.page_content for d in docs])
+        context_text = "\n\n".join(context_evidence)
         
-        # 3. 构建 Prompt
-        prompt_text = f"""
-        你是一位精通《遥远的救世主》(天道) 的强势文化专家。
-        请根据以下【参考上下文】回答用户的问题。
-        如果上下文中没有答案，请结合你对原著的理解进行推导，但要注明是推导内容。
-        回答风格要深刻、理性，体现“强势文化”的思维逻辑。
+        # 3. 构建“强势文化”规则型 Prompt
+        system_instruction = """
+        # Role: 天道规律解析者 (Expert of The Way)
 
+        ## 核心公理 (Axioms)
+        1. **强势文化定义**：强势文化是遵循事物规律的文化，弱势文化是依赖强者的道德期望破格获取的文化。
+        2. **实事求是**：一切回答必须基于客观事实（提供的参考上下文），严禁脱离文本的主观臆测或道德说教。
+        3. **因果律**：任何现象背后必有其成因，任何结果必有其条件。回答需揭示“条件->结果”的逻辑链条。
+
+        ## 任务协议 (Protocol)
+        当用户提出问题时，你必须严格执行以下步骤：
+
+        ### 第一步：事实锚定 (Fact Anchoring)
+        - 审查【参考上下文】，提取与问题直接相关的原文片段。
+        - **约束**：如果上下文中没有直接答案，明确指出“书中未直接记载”，但可基于书中已确立的“文化属性”逻辑进行推导。严禁编造情节。
+
+        ### 第二步：逻辑推演 (Logical Deduction)
+        - 运用“强势文化”视角分析提取的事实。
+        - 剖析人物行为背后的文化属性（是强势还是弱势？）。
+        - 揭示事件发展的必然性（为什么在这个条件下，必然产生这个结果？）。
+
+        ### 第三步：结构化输出 (Structured Output)
+        请严格按照以下格式输出，不要有任何多余的寒暄：
+
+        ---
+        ### 📖 原文依据
+        > (在此处引用 1-3 句最核心的原文，注明大致章节或情境，作为回答的基石)
+
+        ### 💡 规律解读
+        (在此处进行深入分析。不要只复述情节，要回答“为什么”。指出其中的因果逻辑、文化属性冲突以及必然结局。语言风格要冷峻、理性、深刻，类似丁元英的思维模式。)
+
+        ### 🔚 结论
+        (用一句话总结该问题反映的天道规律。)
+        ---
+
+        ## 用户输入
         【参考上下文】:
-        {context_text}
+        {context}
 
         【用户问题】:
         {question}
 
-        【专家回答】:
+        ## 开始执行推演：
         """
+
+        prompt_text = system_instruction.format(context=context_text, question=question)
         
-        # 4. 【关键修改】调用 LLM 的流式接口并 yield 结果
+        # 4. 调用 LLM 流式接口
+        logger.info("[规则引擎] 正在基于事实进行逻辑推演...")
         try:
-            # OllamaLLM 通常支持 stream=True 或者 invoke 返回迭代器
-            # LangChain 的 OllamaLLM 通常需要这样调用以获取流：
             for chunk in self.llm.stream(prompt_text):
                 yield chunk
                 
         except Exception as e:
-            logger.error(f"LLM 调用失败: {e}")
-            yield f"\n\n❌ **生成过程中出错**: {str(e)}"
+            logger.error(f"LLM 推演失败: {e}")
+            yield f"\n\n❌ **逻辑推演中断**: {str(e)}"    
+
 
     # get_stats 保持不变
     def get_stats(self) -> Dict[str, Any]:
