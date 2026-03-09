@@ -121,8 +121,8 @@ class RAGEngine:
         self.hybrid_retriever = None
         
         self.top_k_initial = 6       
-        self.top_k_final = 5         
-        self.max_self_rag_attempts = 2 
+        self.top_k_final = 3         
+        self.max_self_rag_attempts = 1
 
         # 1. Embedding 模型
         logger.info(f"正在加载 Embedding 模型：{embed_model_name} ...")
@@ -147,7 +147,12 @@ class RAGEngine:
 
         # 3. 主 LLM
         logger.info(f"正在加载主模型：{model_name} ...")
-        self.llm = OllamaLLM(model=self.model_name, temperature=0.3, request_timeout=120)
+        self.llm = OllamaLLM(
+            model=self.model_name, 
+            temperature=0.3, 
+            request_timeout=120,
+            num_predict=2048  # <--- 新增此行
+        )
         
         # 4. 评估小模型
         self.eval_llm = self.llm
@@ -331,7 +336,7 @@ class RAGEngine:
         )
 
         try:
-            response = self.llm.invoke(prompt).strip()
+            response = self.eval_llm.invoke(prompt).strip()
             rewritten_query = ""
             if "重写:" in response:
                 rewritten_query = response.split("重写:", 1)[1].strip()
@@ -349,7 +354,7 @@ class RAGEngine:
             logger.warning(f"语义重写失败，回退到原问题：{e}")
             return question
 
-    def _generate_multi_queries_parallel(self, question: str, n: int = 3) -> List[str]:
+    def _generate_multi_queries_parallel(self, question: str, n: int = 1) -> List[str]:
         base_prompt = (
             f"你是一个检索专家。请基于用户关于《遥远的救世主》的问题，生成一个不同角度的检索查询。\n"
             f"用户问题：{question}\n"
@@ -479,7 +484,7 @@ class RAGEngine:
                 timer.checkpoint(f"Attempt_{attempt+1}_Rewrite")
                 
                 # 2. 并行生成 Multi-Query
-                multi_vars = self._generate_multi_queries_parallel(question, n=3)
+                multi_vars = self._generate_multi_queries_parallel(question, n=1)
                 timer.checkpoint(f"Attempt_{attempt+1}_MultiQuery_Gen")
                 
                 current_queries = list(dict.fromkeys([question, rewritten_deep] + multi_vars))
@@ -605,9 +610,10 @@ class RAGEngine:
    - ❌ 错误示例："...规律 [依据 1]" (缺少空格)。
    - 标签格式严格为：`[依据 1]`, `[依据 2]`。
 
-3. **深度展开逻辑**:
-   - 对于每个分论点，请按照 **"观点 -> 原文证据 -> 深度解析 -> 现实意义"** 的逻辑链条展开。
-   - 确保内容详实，逻辑连贯，既有理论高度，又有情节支撑。
+3. **⚡️ 高效表达 (关键)**:
+   - **拒绝注水**：不要写长篇大论的背景介绍或过渡句，直接输出核心观点。
+   - **句式紧凑**：每个分论点严格控制在 **3-4 句话** 内 (观点 + 证据 + 解析)。
+   - **字数控制**：全文尽量控制在 **800 字** 以内，说完即止。
 
 ## 参考上下文
 {context}
@@ -626,9 +632,23 @@ class RAGEngine:
         try:
             yield "💡 正在深度推演...\n\n"
             stream_generator = self.llm.stream(prompt_text)
+            # 用于检测是否还在处理第一行
+            is_first_line = True
+            
             for chunk in stream_generator:
                 if chunk:
                     full_response += chunk
+                    
+                    # 🛡️ 实时修正：如果检测到第一行同时包含 ### 和 ####，强制插入换行
+                    if is_first_line:
+                        if "###" in chunk and "####" in chunk:
+                            # 将 " ### ... ####" 替换为 " ### ...\n\n####"
+                            # 注意：这里简单处理，在第一个 #### 前加两个换行
+                            chunk = chunk.replace(" ####", "\n\n####")
+                            # 更新 full_response 以保持一致性
+                            full_response = full_response.replace(" ####", "\n\n####")
+                        is_first_line = False
+                        
                     yield chunk
         except Exception as e:
             yield f"\n\n❌ 生成中断：{str(e)}"
