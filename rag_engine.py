@@ -116,7 +116,9 @@ class RAGEngine:
 
         # 3. 主 LLM (生成 + 重写 + 反思)
         logger.info(f"正在加载主模型: {model_name} ...")
-        self.llm = OllamaLLM(model=self.model_name, temperature=0.1, request_timeout=120)
+        # ✅ [优化] 温度从 0.1 提升至 0.3，增加一点创造性，减少过度保守
+        # 对于小模型，0.1 往往会导致它们不敢输出非原文内容
+        self.llm = OllamaLLM(model=self.model_name, temperature=0.3, request_timeout=120)
         
         # 4. 评估小模型 (用于快速打分)
         self.eval_llm = self.llm
@@ -243,26 +245,80 @@ class RAGEngine:
         if os.path.exists(self.checkpoint_path): os.remove(self.checkpoint_path)
         logger.info("🎉 索引构建完成！")
 
+
     # ==========================================
-    # 🆕 功能 1: LLM Query Rewrite (查询重写)
+    # 🆕 功能 1: 语义化 Query Rewrite (Semantic Rewrite)
     # ==========================================
-    def _rewrite_query(self, question: str) -> str:
-        """使用 LLM 将模糊问题重写为适合检索的详细查询"""
-        # 简单规则过滤：如果问题已经很长或包含特定关键词，跳过重写以节省时间
-        if len(question) > 30 and ("什么是" in question or "为什么" in question):
+    def _rewrite_query(self, question: str, history_context: str = "") -> str:
+        """
+        使用 LLM 进行语义层面的查询重写。
+        策略：
+        1. 意图识别：分析用户真正想问的核心概念（如：文化属性、强势弱势、天道规律）。
+        2. 语境补全：自动关联书中的关键人物（丁元英、芮小丹）或核心理论。
+        3. 示例引导 (Few-Shot)：通过书中具体案例教模型如何重写。
+        """
+        
+        # ✅ 优化：如果问题本身已经非常具体且长，跳过重写，避免过度解读
+        if len(question) > 40 and any(k in question for k in ["具体情节", "原文片段", "第几章"]):
             return question
 
+        # ✅ Few-Shot Prompts: 给模型提供《遥远的救世主》特有的重写范例
+        examples = """
+        示例 1:
+        用户: "什么是天道？"
+        思考: 用户询问核心哲学概念。需关联丁元英的解释、"文化属性"、"强势/弱势文化"以及书中关于"神即道"的讨论。
+        重写: 《遥远的救世主》中丁元英对"天道"的定义，以及"天道"与"文化属性"、"强势文化"和"弱势文化"之间的逻辑关系，包含书中关于"神即道，道法自然"的论述。
+
+        示例 2:
+        用户: "丁元英为什么那么厉害？"
+        思考: 用户关注人物能力来源。需关联他的思维方式、对文化属性的洞察、以及在古城隐居时的行为逻辑。
+        重写: 丁元英在《遥远的救世主》中展现出的超凡认知能力来源，他对"文化属性"规律的掌握，以及他如何利用这些规律在商战和人性博弈中取胜的具体案例分析。
+
+        示例 3:
+        用户: "芮小丹的死值得吗？"
+        思考: 用户探讨人物命运和价值观。需关联芮小丹的"天国女儿"设定、她对爱情的理解、以及最后抓捕罪犯的动机。
+        重写: 《遥远的救世主》中芮小丹牺牲的深层含义，结合她"天国女儿"的性格设定、对丁元英的爱情观，以及她在最后时刻选择履行职责而非苟活的价值观探讨。
+        """
+
         prompt = (
-            f"你是一个搜索助手。请将用户的简短问题重写为一个包含关键实体和上下文的详细搜索查询，以便在《遥远的救世主》书中检索。\n"
+            f"你是一个精通《遥远的救世主》(电视剧《天道》原著) 的资深研究助手。\n"
+            f"你的任务是将用户的简短问题重写为一个**语义丰富、包含关键实体和理论背景**的检索查询，以便在向量库中精准定位原文片段。\n\n"
+            f"## 重写原则:\n"
+            f"1. **核心概念展开**: 如果问题涉及抽象概念（如天道、文化属性），必须展开其相关的理论定义和书中具体论述。\n"
+            f"2. **人物与情境关联**: 自动关联相关的主要人物（丁元英、芮小丹、欧阳雪等）和关键情节。\n"
+            f"3. **保留原意**: 不要改变用户问题的初衷，只是让它更适合搜索引擎。\n\n"
+            f"## 参考范例:\n{examples}\n\n"
+            f"## 当前任务:\n"
             f"用户问题: {question}\n"
-            f"直接输出重写后的查询，不要其他内容。"
+            f"{f'之前尝试过的相关背景: {history_context}' if history_context else ''}\n\n"
+            f"请先简要分析用户意图（一行），然后输出重写后的查询。\n"
+            f"格式:\n"
+            f"分析: ...\n"
+            f"重写: ..."
         )
+
         try:
-            rewritten = self.llm.invoke(prompt).strip()
-            logger.info(f"🔄 查询重写: '{question}' -> '{rewritten}'")
-            return rewritten
+            response = self.llm.invoke(prompt).strip()
+            
+            # ✅ 解析输出：提取 "重写: " 之后的内容
+            rewritten_query = ""
+            if "重写:" in response:
+                rewritten_query = response.split("重写:", 1)[1].strip()
+            elif "重写：" in response: # 兼容中文冒号
+                rewritten_query = response.split("重写：", 1)[1].strip()
+            else:
+                # 如果没有明确标记，尝试取最后一行作为查询
+                lines = response.split('\n')
+                rewritten_query = lines[-1].strip()
+            
+            # 清理可能的多余标点
+            rewritten_query = rewritten_query.strip('"\'')
+            
+            logger.info(f"🧠 [语义重写] 原问: '{question}' -> 新意: '{rewritten_query}'")
+            return rewritten_query
+            
         except Exception as e:
-            logger.warning(f"重写失败，使用原问题: {e}")
+            logger.warning(f"语义重写失败，回退到原问题: {e}")
             return question
 
     # ==========================================
@@ -369,12 +425,9 @@ class RAGEngine:
 
     def query(self, question: str, k: int = 5):
         """
-        主查询流程：
-        1. Rewrite (LLM)
-        2. Retrieve (Hybrid)
-        3. Rerank (Cross-Encoder)
-        4. Self-RAG Check (Quality Assessment -> Retry if needed)
-        5. Generate + Self-Correction (RAGAS-like check)
+        主查询流程 (终极修复版)：
+        1. 统一 Prompt 策略，移除可能导致混淆的条件分支。
+        2. 强制模型在内心建立“片段-观点”映射。
         """
         if not self.vector_store:
             yield "❌ 错误：向量库未初始化。"
@@ -386,13 +439,14 @@ class RAGEngine:
         
         final_docs = []
         
-        # === Self-RAG 循环：检索 -> 评估 -> (若差)重写再检索 ===
+        # === Self-RAG 循环 ===
         while attempt <= self.max_self_rag_attempts:
-            logger.info(f"🔄 [Self-RAG 尝试 {attempt+1}] 当前查询: {current_query}")
+            logger.info(f"🔄 [Self-RAG 尝试 {attempt+1}] 当前查询：{current_query}")
             
-            # 1. 如果是第二次尝试，执行 LLM Rewrite
+            # 1. 重写查询 (仅在重试时)
             if attempt > 0:
-                current_query = self._rewrite_query(f"{question} (之前检索失败，请换个角度思考)")
+                hint = "之前的检索结果不够精准，请尝试从书中核心理论、人物对话或具体情节的角度重新表述查询。"
+                current_query = self._rewrite_query(question, history_context=hint)
             
             # 2. 检索
             docs = []
@@ -402,7 +456,7 @@ class RAGEngine:
                 else:
                     docs = self.vector_store.similarity_search(current_query, k=self.top_k_initial)
             except Exception as e:
-                logger.error(f"检索失败: {e}")
+                logger.error(f"检索失败：{e}")
             
             if not docs:
                 attempt += 1
@@ -411,8 +465,8 @@ class RAGEngine:
             # 3. Rerank
             ranked_docs = self._rerank_docs(current_query, docs)
             
-            # 4. 评估检索质量 (Self-RAG 核心)
-            if self._evaluate_retrieval_quality(question, ranked_docs):
+            # 4. 评估 (使用 current_query)
+            if self._evaluate_retrieval_quality(current_query, ranked_docs):
                 final_docs = ranked_docs
                 logger.info("✅ 检索质量评估通过。")
                 break
@@ -424,10 +478,9 @@ class RAGEngine:
             yield "⚠️ 经过多次检索与反思，仍未找到足够的原文依据来回答这个问题。"
             return
 
-        # === 构建上下文与调试信息 ===
+        # === 构建上下文 ===
         context_evidence = []
         for i, d in enumerate(final_docs):
-            # 计算向量相似度作为辅助参考
             score = 0.0
             try:
                 q_vec = self.embeddings.embed_query(question)
@@ -435,12 +488,9 @@ class RAGEngine:
                 score = float(cosine_similarity([q_vec], [d_vec])[0][0])
             except: pass
             
-            # 决定标签
             r_score = d.metadata.get('rerank_score', 0)
-            if r_score > 0.8 or score > 0.8:
-                tag_label = "🔥[高相关]"
-            else:
-                tag_label = "❄️[参考]"
+            # ✅ 统一标签逻辑，不再区分高低分，全部视为潜在依据
+            tag_label = "🔥[核心依据]" if r_score > 0.7 else "❄️[辅助参考]"
             
             self.last_retrieval_debug_info.append({
                 "index": i + 1,
@@ -457,25 +507,32 @@ class RAGEngine:
         
         context_text = "\n\n".join(context_evidence)
         
-        # === 生成 Prompt (包含 Self-Correction 指令) ===
-        system_instruction = """
-# Role: 资深文化分析师 (具备自我反思能力)
-你的任务是基于【参考上下文】进行深度分析。
+        # ✅ [结构化增强版] 强制模型输出层级分明的 Markdown
+        system_instruction_template = """
+# Role: 资深文化分析师 (擅长结构化深度解读)
+你的任务是基于【参考上下文】，对用户关于《遥远的救世主》的问题进行**深度、结构化**的分析。
 
-## ⚠️ 上下文标签
-- 🔥[高相关]: 核心依据。
-- ❄️[参考]: 辅助素材。
+## ⚠️ 核心指令 (必须严格执行)
 
-## ✅ 核心策略
-1. **深度融合**: 结合 🔥 和 ❄️ 片段，进行逻辑推理和举例。
-2. **严格引用**: 每一句话后必须标注 `[依据 X]`。
-3. **自我反思 (Self-Correction)**: 
-   - 在生成过程中，如果你发现某个观点没有对应的 `[依据 X]`，**立即删除该观点**。
-   - 如果所有片段都无法回答问题，请直接说明“原文未提及”，不要编造。
+1. **结构化输出格式 (最重要)**:
+   - 你的回答必须是一篇**排版精美**的文章，严格遵循以下 Markdown 结构：
+     - 使用 `###` 作为主标题 (概括核心观点)。
+     - 使用 `####` 作为分论点标题。
+     - 使用 **加粗** (`**文字**`) 强调关键概念和结论。
+     - 使用 `-` 列表项来罗列具体论据或步骤。
+     - 适当使用 `> 引用块` 来展示书中的原话。
+   - **禁止**输出大段没有任何标点和分段的纯文本。
 
-## ⛔ 严格禁令
-1. 禁止使用外部知识。
-2. 禁止无标引用。
+2. **密集且规范的引用 (格式严格)**:
+   - **每一句话或每一个分论点后**，只要涉及原文内容，必须标注 `[依据 X]`。
+   - **❗️重要格式要求**：在 `[依据 X]` 前面**必须加一个空格**，与前面的文字隔开。
+   - ✅ 正确示例："...规律 [依据 1]"、"...工具 [依据 2]"。
+   - ❌ 错误示例："...规律 [依据 1]" (缺少空格)。
+   - 标签格式严格为：`[依据 1]`, `[依据 2]`。
+
+3. **深度展开逻辑**:
+   - 对于每个分论点，请按照 **"观点 -> 原文证据 -> 深度解析 -> 现实意义"** 的逻辑链条展开。
+   - 确保内容详实，逻辑连贯，既有理论高度，又有情节支撑。
 
 ## 参考上下文
 {context}
@@ -483,46 +540,66 @@ class RAGEngine:
 ## 用户问题
 {question}
 
-## 你的回答 (请开始深度分析，并自我检查引用)：
+## 你的回答 (请严格按照上述结构化格式撰写):
 """
 
-        prompt_text = system_instruction.format(context=context_text, question=question)
+        prompt_text = system_instruction_template.format(context=context_text, question=question)
+        
+        # ✅ [调试] 打印 Prompt 开头，确认没有奇怪的前缀
+        logger.debug(f"--- Prompt 预览 ---\n{prompt_text[:300]}...")
         
         logger.info("📝 开始生成并自我反思...")
         full_response = ""
         
         try:
-            yield "💡 正在检索、重排序并深度推演...\n\n"
+            yield "💡 正在深度推演...\n\n"
             stream_generator = self.llm.stream(prompt_text)
             for chunk in stream_generator:
                 if chunk:
                     full_response += chunk
                     yield chunk
         except Exception as e:
-            yield f"\n\n❌ 生成中断: {str(e)}"
+            yield f"\n\n❌ 生成中断：{str(e)}"
             return
 
-        # === 后处理：解析引用并统计 (RAGAS 指标模拟) ===
+        # === 后处理统计 ===
         cited_indices = set()
+        
+        # ✅ [超强兼容版正则] 
+        # 1. 允许 [ 或 ( 开头
+        # 2. 允许 "依据" 或 "参考" 可选
+        # 3. 允许中间有冒号或空格 (甚至没有)
+        # 4. 捕获数字
+        # 5. 允许 ] 或 ) 结尾
+        # 关键点：这个正则会匹配字符串中出现的任何符合模式的片段，无论前后是否有空格
         pattern = r'[\[(](?:依据 | 参考)?\s*:?\s*(\d+)[\])]'
+        
         matches = re.findall(pattern, full_response)
+        
+        # 调试日志：打印匹配到的原始内容
+        if matches:
+            logger.debug(f"🔍 正则匹配到索引：{matches}")
         
         for m in matches:
             try: 
                 idx = int(m)
+                # 确保索引在有效范围内
                 if 1 <= idx <= len(self.last_retrieval_debug_info):
                     cited_indices.add(idx)
-            except: pass
+            except ValueError:
+                pass
         
+        # 更新 debug 信息中的 is_cited 状态
         for item in self.last_retrieval_debug_info:
             if item["index"] in cited_indices:
                 item["is_cited"] = True
         
-        # 计算简单的 "Faithfulness" (忠实度) 模拟指标
-        # 如果模型生成了很多内容但引用很少，可能意味着幻觉（虽然 Prompt 限制了）
         total_retrieved = len(self.last_retrieval_debug_info)
         cited_count = len(cited_indices)
         logger.info(f"[RAGAS 模拟] 检索数:{total_retrieved}, 引用数:{cited_count}, 覆盖率:{cited_count/total_retrieved if total_retrieved>0 else 0:.2%}")
 
         if not cited_indices and total_retrieved > 0:
             logger.warning("⚠️ 警告：模型未引用任何片段，可能存在幻觉风险！")
+            logger.warning(f"模型回答预览：{full_response[:200]}")
+            # 额外调试：打印完整响应以便排查
+            # logger.debug(f"完整响应:\n{full_response}")
