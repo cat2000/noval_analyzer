@@ -3,7 +3,9 @@ import json
 import logging
 import re
 import threading
+import time
 from typing import List, Dict, Any, Optional, Tuple
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # LangChain & AI libs
@@ -60,7 +62,7 @@ class SimpleEnsembleRetriever(BaseRetriever):
         return [item["doc"] for item in sorted_items[:top_k]]
 
 # ==========================================
-# 2. RAG 引擎核心 (集成 Multi-Query, Rerank, Rewrite, Self-RAG)
+# 2. RAG 引擎核心 (集成 Multi-Query, Rerank, Rewrite, Self-RAG, Observability)
 # ==========================================
 class RAGEngine:
     def __init__(self, 
@@ -81,6 +83,13 @@ class RAGEngine:
         self.checkpoint_path = checkpoint_path
         self.model_name = model_name
         
+        # 🆕 可观测性：初始化日志路径
+        self.log_dir = "./logs"
+        os.makedirs(self.log_dir, exist_ok=True)
+        today_str = datetime.now().strftime('%Y%m%d')
+        self.log_file = os.path.join(self.log_dir, f"rag_session_{today_str}.jsonl")
+        logger.info(f"📊 可观测性日志已启用，保存路径：{self.log_file}")
+
         self.vector_store = None
         self.full_text = ""
         self._data_loaded_attempted = False 
@@ -88,7 +97,6 @@ class RAGEngine:
         self.hybrid_retriever = None
         
         # ⚙️ 配置参数优化
-        # 由于加入了 Multi-Query (约 5 路查询)，单路检索数量建议从 10 降至 6，防止总文档数过多导致 Rerank 过慢
         self.top_k_initial = 6       
         self.top_k_final = 5         
         self.max_self_rag_attempts = 2 
@@ -243,6 +251,44 @@ class RAGEngine:
         if os.path.exists(self.checkpoint_path): os.remove(self.checkpoint_path)
         logger.info("🎉 索引构建完成！")
 
+    # ==========================================
+    # 🆕 功能 0: 可观测性埋点 (Observability)
+    # ==========================================
+    def _log_interaction(self, question: str, full_response: str, metrics: Dict[str, Any]):
+        """
+        将单次交互的详细指标和数据快照记录到 JSONL 文件中。
+        用于后续分析 Retrieval Metrics, LLM Metrics, RAG Evaluation。
+        """
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "question": question,
+            "response_length": len(full_response),
+            "metrics": metrics,
+            # 检索详情快照 (脱敏：只存前200字内容，避免日志过大)
+            "retrieval_snapshot": [
+                {
+                    "idx": d["index"],
+                    "chapter": d["chapter"],
+                    "rerank_score": d["rerank_score"],
+                    "is_cited": d["is_cited"],
+                    "content_preview": d["content"][:200] + "..." if len(d["content"]) > 200 else d["content"]
+                } for d in self.last_retrieval_debug_info
+            ],
+            "response_preview": full_response[:500] + "..." if len(full_response) > 500 else full_response,
+            # 风险标记
+            "risk_flags": {
+                "hallucination_risk": metrics["cited_count"] == 0 and metrics["total_retrieved"] > 0,
+                "low_utilization": metrics["citation_rate"] < 0.3 and metrics["total_retrieved"] > 2,
+                "high_latency": metrics["latency_seconds"] > 15.0
+            }
+        }
+        
+        try:
+            with open(self.log_file, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+            logger.debug(f"📝 交互日志已记录：{question[:20]}...")
+        except Exception as e:
+            logger.error(f"❌ 日志记录失败：{e}")
 
     # ==========================================
     # 🆕 功能 1: 语义化 Query Rewrite (深度聚焦)
@@ -296,10 +342,6 @@ class RAGEngine:
     # 🆕 功能 2: Multi-Query 生成 (广度覆盖)
     # ==========================================
     def _generate_multi_queries(self, question: str, n: int = 3) -> List[str]:
-        """
-        让 LLM 基于原问题生成 N 个不同角度的查询变体。
-        策略：同义词替换、视角转换、具体化/抽象化。
-        """
         prompt = (
             f"你是一个检索专家。请基于用户关于《遥远的救世主》的问题，生成 {n} 个不同角度的检索查询。\n"
             f"要求：\n"
@@ -314,9 +356,7 @@ class RAGEngine:
             response = self.llm.invoke(prompt).strip()
             lines = [line.strip() for line in response.split('\n') if line.strip()]
             
-            # 去重并限制数量
             queries = list(dict.fromkeys(lines))[:n] 
-            # 确保原问题也在候选池中（作为兜底）
             if question not in queries:
                 queries.append(question)
                 
@@ -373,7 +413,8 @@ class RAGEngine:
         
         top_doc = docs[0]
         top_score = top_doc.metadata.get('rerank_score', 0)
-        
+
+        # 🚀 优化：提高直接通过的阈值，减少小模型调用
         if top_score > 0.85:
             logger.info(f"✅ Rerank 高分 ({top_score:.2f}) 直接通过评估。")
             return True
@@ -411,8 +452,10 @@ class RAGEngine:
 
     def query(self, question: str, k: int = 5):
         """
-        主查询流程 (Multi-Query + Self-RAG 终极版)
+        主查询流程 (Multi-Query + Self-RAG + Observability)
         """
+        start_time = time.time() # 🆕 记录开始时间
+
         if not self.vector_store:
             yield "❌ 错误：向量库未初始化。"
             return
@@ -425,27 +468,20 @@ class RAGEngine:
         while attempt <= self.max_self_rag_attempts:
             logger.info(f"🔄 [Self-RAG 尝试 {attempt+1}]")
             
-            # 1. 确定当前查询列表 (Multi-Query 核心逻辑)
             current_queries = []
             if attempt == 0:
-                # === 首次尝试：广度优先 (Multi-Query) ===
-                # 策略：原问题 + 深度重写 + 3个多视角变体
                 rewritten_deep = self._rewrite_query(question) 
                 multi_vars = self._generate_multi_queries(question, n=3)
-                # 合并并去重
                 current_queries = list(dict.fromkeys([question, rewritten_deep] + multi_vars))
                 logger.info(f"📢 [广度模式] 执行 {len(current_queries)} 路检索：{current_queries}")
             else:
-                # === 重试模式：深度优先 (聚焦) ===
-                # 策略：如果广度检索失败，说明噪声太多，此时需要极度聚焦
                 hint = "之前的检索结果不够精准，请尝试从书中核心理论、人物对话或具体情节的角度重新表述查询。"
                 deep_rewrite = self._rewrite_query(question, history_context=hint)
                 current_queries = [deep_rewrite]
                 logger.info(f"📢 [深度模式] 重试聚焦检索：{deep_rewrite}")
 
-            # 2. 执行检索 (合并结果)
             all_docs = []
-            seen_content = set() # 用于全局去重
+            seen_content = set()
             
             for q in current_queries:
                 try:
@@ -454,7 +490,6 @@ class RAGEngine:
                     else:
                         docs = self.vector_store.similarity_search(q, k=self.top_k_initial)
                     
-                    # 去重：如果内容完全一样，就不重复添加了
                     for doc in docs:
                         if doc.page_content not in seen_content:
                             seen_content.add(doc.page_content)
@@ -467,12 +502,8 @@ class RAGEngine:
                 continue
                 
             logger.info(f"📦 合并后去重文档总数：{len(all_docs)}")
-
-            # 3. Rerank (对合并后的大池子进行重排序)
-            # 注意：这里使用原问题 question 作为 Rerank 的基准，比用变体查询更稳定
             ranked_docs = self._rerank_docs(question, all_docs)
             
-            # 4. 评估
             if self._evaluate_retrieval_quality(question, ranked_docs):
                 final_docs = ranked_docs
                 logger.info("✅ 检索质量评估通过。")
@@ -481,8 +512,20 @@ class RAGEngine:
                 logger.info("❌ 检索质量评估未通过，准备重试...")
                 attempt += 1
         
+        end_retrieval_time = time.time()
+        
         if not final_docs:
             yield "⚠️ 经过多次检索与反思，仍未找到足够的原文依据来回答这个问题。"
+            # 记录失败案例
+            metrics = {
+                "status": "failed",
+                "latency_seconds": time.time() - start_time,
+                "self_rag_attempts": attempt + 1,
+                "total_retrieved": 0,
+                "cited_count": 0,
+                "citation_rate": 0.0
+            }
+            self._log_interaction(question, "", metrics)
             return
 
         # === 构建上下文 ===
@@ -564,6 +607,9 @@ class RAGEngine:
             yield f"\n\n❌ 生成中断：{str(e)}"
             return
 
+        end_time = time.time()
+        total_latency = end_time - start_time
+
         # === 后处理统计 ===
         cited_indices = set()
         pattern = r'[\[(](?:依据 | 参考)?\s*:?\s*(\d+)[\])]'
@@ -587,7 +633,26 @@ class RAGEngine:
         
         total_retrieved = len(self.last_retrieval_debug_info)
         cited_count = len(cited_indices)
-        logger.info(f"[RAGAS 模拟] 检索数:{total_retrieved}, 引用数:{cited_count}, 覆盖率:{cited_count/total_retrieved if total_retrieved>0 else 0:.2%}")
+        citation_rate = cited_count / total_retrieved if total_retrieved > 0 else 0
+        
+        logger.info(f"[RAGAS 模拟] 检索数:{total_retrieved}, 引用数:{cited_count}, 覆盖率:{citation_rate:.2%}")
 
         if not cited_indices and total_retrieved > 0:
             logger.warning("⚠️ 警告：模型未引用任何片段，可能存在幻觉风险！")
+
+        # 🆕 计算并记录详细指标
+        metrics = {
+            "status": "success",
+            "latency_seconds": round(total_latency, 2),
+            "retrieval_latency": round(end_retrieval_time - start_time, 2),
+            "generation_latency": round(total_latency - (end_retrieval_time - start_time), 2),
+            "self_rag_attempts": attempt + 1,
+            "total_retrieved": total_retrieved,
+            "cited_count": cited_count,
+            "citation_rate": round(citation_rate, 4),
+            "top_rerank_score": round(final_docs[0].metadata.get('rerank_score', 0), 4) if final_docs else 0,
+            "noise_ratio": round(1 - citation_rate, 4) # 未被引用的比例
+        }
+
+        # 🆕 写入日志
+        self._log_interaction(question, full_response, metrics)
