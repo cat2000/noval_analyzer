@@ -632,25 +632,111 @@ class RAGEngine:
         try:
             yield "💡 正在深度推演...\n\n"
             stream_generator = self.llm.stream(prompt_text)
-            # 用于检测是否还在处理第一行
-            is_first_line = True
+            
+            # 🛡️ 状态机变量
+            first_line_processed = False
+            first_line_buffer = ""
+            MAX_FIRST_LINE_LEN = 80  # 如果第一行超过80字符还没换行，强制截断处理
             
             for chunk in stream_generator:
-                if chunk:
-                    full_response += chunk
+                if not chunk:
+                    continue
+                
+                # === 阶段 1: 第一行尚未处理完毕 ===
+                if not first_line_processed:
+                    first_line_buffer += chunk
                     
-                    # 🛡️ 实时修正：如果检测到第一行同时包含 ### 和 ####，强制插入换行
-                    if is_first_line:
-                        if "###" in chunk and "####" in chunk:
-                            # 将 " ### ... ####" 替换为 " ### ...\n\n####"
-                            # 注意：这里简单处理，在第一个 #### 前加两个换行
-                            chunk = chunk.replace(" ####", "\n\n####")
-                            # 更新 full_response 以保持一致性
-                            full_response = full_response.replace(" ####", "\n\n####")
-                        is_first_line = False
+                    # 触发条件 A: 遇到换行符
+                    # 触发条件 B: 缓冲区长度超过阈值 (防止模型不换行导致卡死或误判)
+                    should_process = False
+                    if '\n' in first_line_buffer:
+                        should_process = True
+                    elif len(first_line_buffer) >= MAX_FIRST_LINE_LEN:
+                        should_process = True
+                        logger.debug(f"⚠️ 第一行过长 ({len(first_line_buffer)} chars)，强制截断处理。")
+                    
+                    if should_process:
+                        first_line_processed = True
                         
+                        # 分割内容
+                        if '\n' in first_line_buffer:
+                            parts = first_line_buffer.split('\n', 1)
+                            line = parts[0]
+                            remainder = parts[1]
+                        else:
+                            # 没有换行符，整段作为 line，remainder 为空
+                            line = first_line_buffer
+                            remainder = ""
+                        
+                        clean_line = line.strip()
+                        
+                        # 🔍 去重判断逻辑
+                        # 1. 提取纯文本 (去掉 #)
+                        title_text = re.sub(r'^#+\s*', '', clean_line).strip()
+                        
+                        # 2. 清洗问题 (去掉标点)
+                        q_clean = re.sub(r'[?？,.，!！:\:]', '', question).strip()
+                        t_clean = re.sub(r'[?？,.，!！:\:]', '', title_text).strip()
+                        
+                        is_duplicate = False
+                        
+                        # 只有当提取出的文本长度大于 2 时才进行比对 (避免误杀短词)
+                        if len(q_clean) > 2 and len(t_clean) > 2:
+                            # 规则 A: 完全相等
+                            if q_clean == t_clean:
+                                is_duplicate = True
+                            # 规则 B: 包含且长度接近 (防止 "问题：什么是天道" vs "什么是天道")
+                            elif (q_clean in t_clean or t_clean in q_clean) and abs(len(q_clean) - len(t_clean)) < 5:
+                                is_duplicate = True
+                            # 规则 C: 高重合度
+                            else:
+                                set_q = set(q_clean)
+                                set_t = set(t_clean)
+                                if len(set_q) > 0:
+                                    overlap = len(set_q & set_t) / len(set_q)
+                                    if overlap > 0.85:
+                                        is_duplicate = True
+                        
+                        if is_duplicate:
+                            logger.info(f"🧹 [拦截] 丢弃重复/无效首行: '{clean_line[:50]}...'")
+                            # 丢弃该行。如果有剩余内容 (remainder)，直接输出
+                            if remainder:
+                                yield remainder
+                        else:
+                            logger.info(f"✅ [保留] 有效首行: '{clean_line[:50]}...'")
+                            # 保留该行。输出时确保 Markdown 格式正确 (标题后加双换行)
+                            # 如果原行没有换行符 (因为是长度截断的)，我们需要补一个
+                            output_line = line
+                            if not line.endswith('\n'):
+                                output_line += "\n"
+                            
+                            yield output_line + "\n" # 确保标题后有空白行
+                            if remainder:
+                                yield remainder
+                
+                # === 阶段 2: 第一行已处理，后续所有字符直接透传 ===
+                else:
                     yield chunk
+
+            # === 兜底：如果流结束了，第一行还没处理 (极罕见情况) ===
+            if not first_line_processed and first_line_buffer:
+                line = first_line_buffer.strip()
+                # 复用上面的去重逻辑 (简化版)
+                title_text = re.sub(r'^#+\s*', '', line).strip()
+                q_clean = re.sub(r'[?？,.，!！]', '', question).strip()
+                t_clean = re.sub(r'[?？,.，!！]', '', title_text).strip()
+                
+                is_duplicate = (len(q_clean) > 2 and len(t_clean) > 2) and (
+                    q_clean == t_clean or 
+                    ((q_clean in t_clean or t_clean in q_clean) and abs(len(q_clean) - len(t_clean)) < 5)
+                )
+                
+                if not is_duplicate:
+                    yield line + "\n\n"
+                # 否则静默丢弃
+
         except Exception as e:
+            logger.error(f"生成流异常：{e}")
             yield f"\n\n❌ 生成中断：{str(e)}"
             return
 
