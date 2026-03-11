@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 设置窗口标题
-echo "正在启动强势文化专家系统 (Self-RAG + Rerank 进阶版)..." # ✅ [修改] 标题更新
+echo "🚀 正在启动强势文化专家系统 (Self-RAG + CoT + Rerank 进阶版)..." 
 echo "------------------------------------------------"
 
 # 获取当前脚本所在目录
@@ -11,7 +11,7 @@ cd "$(dirname "$0")"
 VENV_ACTIVATE="./.venv/bin/activate"
 MODEL_NAME="qwen3" 
 EVAL_MODEL_NAME="qwen3:0.6b"
-# 新增：HuggingFace 模型配置 (用于日志显示，实际下载由代码控制)
+# 模型配置 (用于日志显示)
 EMBED_MODEL="BAAI/bge-large-zh"
 RERANK_MODEL="BAAI/bge-reranker-large"
 # ===========================================
@@ -36,26 +36,28 @@ fi
 echo "📦 检查并升级依赖库..."
 pip install --quiet --upgrade pip
 
-# ✅ [修改] 确保 sentence-transformers 和相关库是最新的，以支持 CrossEncoder
+# ✅ [修改] 添加了 jieba 用于关键词快速过滤
 pip install --upgrade --quiet \
     "langchain>=0.3.0" "langchain-core>=0.3.0" "langchain-community>=0.3.0" \
     "langchain-text-splitters" "langchain-ollama" "langchain-huggingface" \
-    "chromadb" "streamlit" "sentence-transformers>=0.29.0" "scikit-learn" "rank_bm25" "requests" "torch"
+    "chromadb" "streamlit" "sentence-transformers>=0.29.0" "scikit-learn" \
+    "rank_bm25" "requests" "torch" "jieba"
 
 # 3. 检查 Ollama
 echo "🤖 检查 Ollama 服务..."
 if ! curl -s http://localhost:11434/api/tags &> /dev/null; then
     echo "   ⚠️  Ollama 未运行，尝试启动..."
     if command -v ollama &> /dev/null; then
+        # 确保后台启动不占用当前终端输出
         nohup ollama serve > ollama.log 2>&1 &
         sleep 4
         if ! curl -s http://localhost:11434/api/tags &> /dev/null; then
-            echo "❌ Ollama 启动失败，请手动运行 'ollama serve'。"
+            echo "❌ Ollama 启动失败，请手动运行 'ollama serve' 查看错误日志。"
             exit 1
         fi
         echo "   ✅ Ollama 服务已启动。"
     else
-        echo "❌ 未找到 ollama 命令。"
+        echo "❌ 未找到 ollama 命令，请先安装 Ollama。"
         exit 1
     fi
 else
@@ -65,16 +67,16 @@ fi
 # 4. 检查 LLM 模型 (Ollama)
 echo "📥 检查 Ollama 模型库..."
 for model in "$MODEL_NAME" "$EVAL_MODEL_NAME"; do
-    if ! ollama list | grep -q "^$model\s"; then
+    # ✅ [优化] 放宽 grep 匹配规则，防止因空格导致的匹配失败
+    if ! ollama list | grep -q "$model"; then
         echo "   ⚠️  下载模型 $model (这可能需要几分钟)..."
-        ollama pull $model
+        ollama pull "$model"
     else
         echo "   ✅ $model 已就绪。"
     fi
 done
 
 # 5. 配置 HuggingFace 镜像 (关键！用于加速 Embedding 和 Rerank 模型下载)
-# ✅ [修改] 强调这一步对新版架构的重要性
 echo "🌐 配置 HuggingFace 镜像源 (加速 BGE 模型下载)..."
 export HF_ENDPOINT=https://hf-mirror.com
 echo "   ✅ 已设置 HF_ENDPOINT=$HF_ENDPOINT"
@@ -84,9 +86,10 @@ echo "🚀 正在启动 Web 界面..."
 echo "----------------------------------------"
 echo "📊 架构配置:"
 echo "   - 生成/重写 LLM : $MODEL_NAME"
-echo "   - 评估 LLM      : $EVAL_MODEL_NAME"
+echo "   - 评估 LLM      : $EVAL_MODEL_NAME (CoT 增强)"
 echo "   - Embedding     : $EMBED_MODEL (自动下载)"
 echo "   - Rerank        : $RERANK_MODEL (自动下载)"
+echo "   - 分词工具      : jieba (关键词预检)"
 echo "----------------------------------------"
 
 URL="http://localhost:8501"
@@ -95,15 +98,20 @@ URL="http://localhost:8501"
 STREAMLIT_CMD="streamlit run app.py --server.headless true --server.address localhost --server.port 8501"
 
 # 后台启动
-$STREAMLIT_CMD &
+$STREAMLIT_CMD > streamlit.log 2>&1 &
 STREAMLIT_PID=$!
 
-# 等待服务就绪 (最多等待 15 秒，因为首次加载 Rerank 模型可能稍慢)
-echo "⏳ 等待服务启动 (首次运行需下载 BGE 模型，请稍候)..."
-for i in {1..15}; do
+# ✅ [优化] 延长等待时间至 40 秒，因为首次加载 Rerank 大模型较慢
+WAIT_TIME=40
+echo "⏳ 等待服务启动 (首次运行需下载/加载 BGE 模型，请稍候)..."
+for i in $(seq 1 $WAIT_TIME); do
     if curl -s $URL &> /dev/null; then
-        echo "✅ 服务已就绪!"
+        echo "✅ 服务已就绪! (耗时 ${i}s)"
         break
+    fi
+    # 每 5 秒给一个提示，避免用户以为卡死
+    if [ $((i % 5)) -eq 0 ]; then
+        echo "   ... 正在加载重排序模型 (这可能比较慢) ..."
     fi
     sleep 1
 done
@@ -121,18 +129,21 @@ if curl -s $URL &> /dev/null; then
     else
         echo "💡 请手动在浏览器访问: $URL"
     fi
+    echo ""
+    echo "✅ 系统运行中 (PID: $STREAMLIT_PID)"
+    echo "📝 日志文件: streamlit.log"
+    echo "按 Ctrl+C 停止服务..."
 else
-    echo "⚠️  服务启动超时。"
-    echo "💡 首次运行可能需要下载 BGE 模型文件 (约 1GB+)，请耐心等待终端输出。"
-    echo "   或者手动访问: $URL"
+    echo "⚠️  服务启动超时 (${WAIT_TIME}s)。"
+    echo "💡 可能原因："
+    echo "   1. 首次下载 BGE 模型文件较大 (约 1.3GB)，网速较慢。"
+    echo "   2. 显存/内存不足导致模型加载失败。"
+    echo "👉 请查看 'streamlit.log' 获取详细错误信息。"
+    echo "   或者手动访问: $URL (如果服务其实已经启动只是慢了点)"
 fi
 
-echo ""
-echo "✅ 系统运行中 (PID: $STREAMLIT_PID)"
-echo "按 Ctrl+C 停止服务..."
-
 # 捕获 Ctrl+C 以清理进程
-trap "kill $STREAMLIT_PID 2>/dev/null; echo ''; echo '服务已停止。'; exit" INT TERM
+trap "kill $STREAMLIT_PID 2>/dev/null; echo ''; echo '🛑 服务已停止。'; exit" INT TERM
 
 # 等待主进程
 wait $STREAMLIT_PID

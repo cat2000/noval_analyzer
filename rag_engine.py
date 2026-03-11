@@ -2,9 +2,9 @@ import os
 import json
 import logging
 import re
-import threading
+import jieba
 import time
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -20,15 +20,12 @@ from langchain_core.retrievers import BaseRetriever
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
-# ✅ Logger 配置
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Logger 配置
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# 🆕 工具：Pipeline 性能计时器
+# 工具类：Pipeline 性能计时器
 # ==========================================
 class PipelineTimer:
     def __init__(self):
@@ -37,12 +34,10 @@ class PipelineTimer:
         self.stages = {}
 
     def checkpoint(self, stage_name: str) -> float:
-        """记录当前阶段结束时间，计算耗时，并打印日志"""
         current_time = time.time()
         duration = current_time - self.last_checkpoint
         self.stages[stage_name] = round(duration, 4)
         self.last_checkpoint = current_time
-        
         logger.info(f"⏱️ [{stage_name}] 耗时：{duration:.4f} 秒")
         return duration
 
@@ -53,7 +48,75 @@ class PipelineTimer:
         return self.stages
 
 # ==========================================
-# 1. 自定义混合检索器 (保持不变)
+# 流式生成收集器 (保持原有逻辑，确保流式稳定)
+# ==========================================
+class StreamingResponseCollector:
+    def __init__(self, llm, prompt_text):
+        self.llm = llm
+        self.prompt_text = prompt_text
+        self.full_response = ""
+        self.first_line_processed = False
+        self.first_line_buffer = ""
+        self.MAX_FIRST_LINE_LEN = 80
+        self.question_for_dedup = ""
+        
+    def generate(self, question=""):
+        """生成流并累积内容"""
+        self.question_for_dedup = question
+        try:
+            stream_generator = self.llm.stream(self.prompt_text)
+            
+            for chunk in stream_generator:
+                if not chunk:
+                    continue
+                
+                self.full_response += chunk
+                
+                # 首行去重逻辑
+                if not self.first_line_processed:
+                    self.first_line_buffer += chunk
+                    should_process = '\n' in self.first_line_buffer or len(self.first_line_buffer) >= self.MAX_FIRST_LINE_LEN
+                    
+                    if should_process:
+                        self.first_line_processed = True
+                        parts = self.first_line_buffer.split('\n', 1) if '\n' in self.first_line_buffer else [self.first_line_buffer, ""]
+                        line = parts[0].strip()
+                        remainder = parts[1] if len(parts) > 1 else ""
+                        
+                        is_duplicate = False
+                        if self.question_for_dedup:
+                            q_clean = re.sub(r'[?？,.，!！:\:]', '', self.question_for_dedup).strip()
+                            t_clean = re.sub(r'^#+\s*', '', line).strip()
+                            t_clean = re.sub(r'[?？,.，!！:\:]', '', t_clean).strip()
+                            if len(q_clean) > 2 and len(t_clean) > 2:
+                                if q_clean == t_clean: is_duplicate = True
+                                elif (q_clean in t_clean or t_clean in q_clean) and abs(len(q_clean) - len(t_clean)) < 5: is_duplicate = True
+                        
+                        if not is_duplicate:
+                            output = line + "\n" + remainder if remainder else line + "\n"
+                            yield output
+                        elif remainder:
+                            yield remainder
+                else:
+                    yield chunk
+            
+            if not self.first_line_processed and self.first_line_buffer:
+                line = self.first_line_buffer.strip()
+                is_duplicate = False
+                if self.question_for_dedup:
+                    q_clean = re.sub(r'[?？,.，!！]', '', self.question_for_dedup).strip()
+                    t_clean = re.sub(r'^#+\s*', '', line).strip()
+                    t_clean = re.sub(r'[?？,.，!！]', '', t_clean).strip()
+                    if len(q_clean) > 2 and len(t_clean) > 2 and q_clean == t_clean:
+                        is_duplicate = True
+                if not is_duplicate:
+                    yield line + "\n\n"
+        except Exception as e:
+            logger.error(f"流式生成过程中出错：{e}")
+            raise e
+
+# ==========================================
+# 组件：自定义混合检索器
 # ==========================================
 class SimpleEnsembleRetriever(BaseRetriever):
     retrievers: List[BaseRetriever]
@@ -66,6 +129,8 @@ class SimpleEnsembleRetriever(BaseRetriever):
         all_results = []
         for retriever in self.retrievers:
             try:
+                if hasattr(retriever, 'k'):
+                    retriever.k = self.k
                 docs = retriever.invoke(query)
                 all_results.append(docs)
             except Exception as e:
@@ -87,9 +152,45 @@ class SimpleEnsembleRetriever(BaseRetriever):
         return [item["doc"] for item in sorted_items[:top_k]]
 
 # ==========================================
-# 2. RAG 引擎核心 (集成细粒度计时)
+# 核心引擎：RAGEngine (Self-RAG 优化版)
 # ==========================================
 class RAGEngine:
+    PROMPT_REWRITE_EXAMPLES = """
+    示例 1:
+    用户："什么是天道？"
+    重写：《遥远的救世主》中丁元英对"天道"的定义，以及"天道"与"文化属性"、"强势文化"和"弱势文化"之间的逻辑关系。
+    示例 2:
+    用户："丁元英为什么那么厉害？"
+    重写：丁元英在《遥远的救世主》中展现出的超凡认知能力来源，他对"文化属性"规律的掌握，以及他如何利用这些规律在商战和人性博弈中取胜的具体案例分析。
+    """
+
+    PROMPT_EVALUATE_TEMPLATE = (
+        "你是一个严格的评估助手。请判断给定的【文档片段】是否包含与【用户问题】相关的**实质性内容**。\n"
+        "用户问题：{question}\n"
+        "文档片段 (Top 1): {doc_content}...\n"
+        "如果片段与问题相关（哪怕只是部分相关），输出 'YES'。\n"
+        "如果片段完全无关，输出 'NO'。\n"
+        "只输出 YES 或 NO。"
+    )
+
+    PROMPT_GENERATION_TEMPLATE = """
+# Role: 严谨的《遥远的救世主》研究专家
+你的任务是基于【参考上下文】回答用户问题。你必须像律师举证一样，**每一句论点都必须有原文依据**。
+
+## ⚠️ 铁律 (违反任意一条即视为任务失败)
+1. **强制引用机制**: 每一个分论点、事实陈述后必须紧跟 ` [依据 X]` (注意空格)。
+2. **上下文索引映射**: 只能使用提供的 `[依据 1]`, `[依据 2]`... 标签。
+3. **结构化输出**: 使用 `###` 标题，`####` 分论点。
+
+## 参考上下文
+{context}
+
+## 用户问题
+{question}
+
+## 你的回答 (开始执行，记得每句话都要带引用):
+"""
+
     def __init__(self, 
                  txt_path: str, 
                  db_path: str = "./chroma_db", 
@@ -99,10 +200,6 @@ class RAGEngine:
                  embed_model_name: str = "bge-large-zh",
                  rerank_model_name: str = "BAAI/bge-reranker-large"):
         
-        global logger
-        if 'logger' not in globals() or logger is None:
-            logger = logging.getLogger(__name__)
-
         self.txt_path = txt_path
         self.db_path = db_path
         self.checkpoint_path = checkpoint_path
@@ -119,57 +216,51 @@ class RAGEngine:
         self._data_loaded_attempted = False 
         self.last_retrieval_debug_info = []
         self.hybrid_retriever = None
+        self.metrics = {}
         
-        self.top_k_initial = 6       
-        self.top_k_final = 3         
-        self.max_self_rag_attempts = 1
+        # 默认参数 (允许前端覆盖)
+        self.default_params = {
+            "top_k_initial": 8,      # 平衡点
+            "top_k_final": 3,
+            "max_self_rag_attempts": 1, # 允许重试1次 (共2轮)
+            "multi_query_count": 1,
+            "rerank_threshold": 0.5
+        }
 
-        # 1. Embedding 模型
-        logger.info(f"正在加载 Embedding 模型：{embed_model_name} ...")
+        self._load_models(embed_model_name, rerank_model_name, model_name, eval_model_name)
+        
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800, chunk_overlap=300, 
+            separators=["\n\n", "\n", "。", "！", "？", "；", "……", " ", ""]
+        )
+        self.chapter_pattern = re.compile(r'第\s*(\d+|[一二三四五六七八九十百]+)\s*章')
+
+    def _load_models(self, embed_name, rerank_name, llm_name, eval_llm_name):
+        logger.info(f"正在加载 Embedding 模型：{embed_name} ...")
         self.embeddings = HuggingFaceEmbeddings(
             model_name="BAAI/bge-large-zh",
             model_kwargs={'device': 'cpu'}, 
             encode_kwargs={'normalize_embeddings': True, 'batch_size': 32}
         )
 
-        # 2. Reranker 模型
-        logger.info(f"正在加载 Reranker 模型：{rerank_model_name} ...")
+        logger.info(f"正在加载 Reranker 模型：{rerank_name} ...")
         try:
-            self.reranker = CrossEncoder(
-                model_name=rerank_model_name,
-                max_length=512,
-                device='cpu' 
-            )
+            self.reranker = CrossEncoder(model_name=rerank_name, max_length=512, device='cpu')
             logger.info("✅ Reranker 加载成功。")
         except Exception as e:
             logger.error(f"❌ Reranker 加载失败：{e}，将降级为不使用 Rerank。")
             self.reranker = None
 
-        # 3. 主 LLM
-        logger.info(f"正在加载主模型：{model_name} ...")
-        self.llm = OllamaLLM(
-            model=self.model_name, 
-            temperature=0.3, 
-            request_timeout=120,
-            num_predict=2048  # <--- 新增此行
-        )
+        logger.info(f"正在加载主模型：{llm_name} ...")
+        self.llm = OllamaLLM(model=llm_name, temperature=0.3, request_timeout=120, num_predict=2048)
         
-        # 4. 评估小模型
         self.eval_llm = self.llm
-        if eval_model_name and eval_model_name != model_name:
+        if eval_llm_name and eval_llm_name != llm_name:
             try:
-                logger.info(f"正在加载评估小模型：{eval_model_name} ...")
-                self.eval_llm = OllamaLLM(model=eval_model_name, temperature=0, request_timeout=60)
+                logger.info(f"正在加载评估小模型：{eval_llm_name} ...")
+                self.eval_llm = OllamaLLM(model=eval_llm_name, temperature=0, request_timeout=60)
             except Exception as e:
                 logger.warning(f"加载评估模型失败，降级使用主模型。")
-        
-        # 5. 切片配置
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            chunk_overlap=300, 
-            separators=["\n\n", "\n", "。", "！", "？", "；", "……", " ", ""]
-        )
-        self.chapter_pattern = re.compile(r'第\s*(\d+|[一二三四五六七八九十百]+)\s*章')
 
     def load_data(self):
         if self._data_loaded_attempted and self.vector_store is not None:
@@ -201,22 +292,22 @@ class RAGEngine:
         logger.info("构建混合检索器 (BM25 + Vector)...")
         try:
             all_docs_data = self.vector_store.get(include=["metadatas", "documents"])
-            if not all_docs_data['documents']:
-                return
+            if not all_docs_data['documents']: return
 
             docs_obj = [Document(page_content=c, metadata=m) for c, m in zip(all_docs_data['documents'], all_docs_data['metadatas'])]
             
             bm25_retriever = BM25Retriever.from_documents(docs_obj)
-            bm25_retriever.k = self.top_k_initial
+            bm25_retriever.k = self.default_params["top_k_initial"]
             
             vector_retriever = self.vector_store.as_retriever(
-                search_type="mmr", search_kwargs={"k": self.top_k_initial, "fetch_k": 40, "lambda_mult": 0.5}
+                search_type="mmr", 
+                search_kwargs={"k": self.default_params["top_k_initial"], "fetch_k": 100, "lambda_mult": 0.5}
             )
             
             self.hybrid_retriever = SimpleEnsembleRetriever(
                 retrievers=[bm25_retriever, vector_retriever],
                 weights=[0.7, 0.3], 
-                k=self.top_k_initial 
+                k=self.default_params["top_k_initial"] 
             )
             logger.info("✅ 混合检索器就绪。")
         except Exception as e:
@@ -236,24 +327,6 @@ class RAGEngine:
             except UnicodeDecodeError:
                 continue
         raise ValueError(f"无法读取文件。")
-
-    def _load_checkpoint(self) -> int:
-        if os.path.exists(self.checkpoint_path):
-            try:
-                with open(self.checkpoint_path, 'r', encoding='utf-8') as f:
-                    return json.load(f).get("processed_chars", 0)
-            except: return 0
-        return 0
-
-    def _save_checkpoint(self, processed_chars: int):
-        try:
-            with open(self.checkpoint_path, 'w', encoding='utf-8') as f:
-                json.dump({"processed_chars": processed_chars}, f)
-        except: pass
-
-    def _get_current_chapter(self, text_segment: str, last_chapter: str) -> str:
-        matches = self.chapter_pattern.findall(text_segment)
-        return f"第{matches[-1]}章" if matches else last_chapter
 
     def _process_and_embed(self):
         start_index = self._load_checkpoint()
@@ -279,6 +352,24 @@ class RAGEngine:
         if os.path.exists(self.checkpoint_path): os.remove(self.checkpoint_path)
         logger.info("🎉 索引构建完成！")
 
+    def _load_checkpoint(self) -> int:
+        if os.path.exists(self.checkpoint_path):
+            try:
+                with open(self.checkpoint_path, 'r', encoding='utf-8') as f:
+                    return json.load(f).get("processed_chars", 0)
+            except: return 0
+        return 0
+
+    def _save_checkpoint(self, processed_chars: int):
+        try:
+            with open(self.checkpoint_path, 'w', encoding='utf-8') as f:
+                json.dump({"processed_chars": processed_chars}, f)
+        except: pass
+
+    def _get_current_chapter(self, text_segment: str, last_chapter: str) -> str:
+        matches = self.chapter_pattern.findall(text_segment)
+        return f"第{matches[-1]}章" if matches else last_chapter
+
     def _log_interaction(self, question: str, full_response: str, metrics: Dict[str, Any]):
         log_entry = {
             "timestamp": datetime.now().isoformat(),
@@ -287,11 +378,8 @@ class RAGEngine:
             "metrics": metrics,
             "retrieval_snapshot": [
                 {
-                    "idx": d["index"],
-                    "chapter": d["chapter"],
-                    "rerank_score": d["rerank_score"],
-                    "is_cited": d["is_cited"],
-                    "content_preview": d["content"][:200] + "..." if len(d["content"]) > 200 else d["content"]
+                    "idx": d["index"], "chapter": d["chapter"], "rerank_score": d["rerank_score"],
+                    "is_cited": d["is_cited"], "content_preview": d["content"][:200] + "..." if len(d["content"]) > 200 else d["content"]
                 } for d in self.last_retrieval_debug_info
             ],
             "response_preview": full_response[:500] + "..." if len(full_response) > 500 else full_response,
@@ -301,166 +389,285 @@ class RAGEngine:
                 "high_latency": metrics.get("latency_seconds", 0) > 15.0
             }
         }
-        
         try:
             with open(self.log_file, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
-            logger.debug(f"📝 交互日志已记录：{question[:20]}...")
         except Exception as e:
             logger.error(f"❌ 日志记录失败：{e}")
 
-    def _rewrite_query(self, question: str, history_context: str = "") -> str:
+    # ==========================================
+    # 核心逻辑方法 (Self-RAG 优化版)
+    # ==========================================
+    
+    def _rewrite_query(self, question: str, history_context: str = "", mode: str = "deep") -> str:
+        if mode == "direct":
+            return question
+        if mode == "light":
+            clean_q = re.sub(r'(请问 | 帮我 | 分析一下 | 什么是 | 为什么)', '', question)
+            return clean_q.strip()
+        
         if len(question) > 40 and any(k in question for k in ["具体情节", "原文片段", "第几章"]):
             return question
-
-        examples = """
-        示例 1:
-        用户："什么是天道？"
-        重写：《遥远的救世主》中丁元英对"天道"的定义，以及"天道"与"文化属性"、"强势文化"和"弱势文化"之间的逻辑关系。
-        示例 2:
-        用户："丁元英为什么那么厉害？"
-        重写：丁元英在《遥远的救世主》中展现出的超凡认知能力来源，他对"文化属性"规律的掌握，以及他如何利用这些规律在商战和人性博弈中取胜的具体案例分析。
-        """
 
         prompt = (
             f"你是一个精通《遥远的救世主》的资深研究助手。\n"
             f"任务：将用户问题重写为**语义丰富、包含关键实体**的检索查询。\n\n"
-            f"## 参考范例:\n{examples}\n\n"
+            f"## 参考范例:\n{self.PROMPT_REWRITE_EXAMPLES}\n\n"
             f"## 当前任务:\n"
             f"用户问题：{question}\n"
             f"{f'之前尝试过的相关背景：{history_context}' if history_context else ''}\n\n"
-            f"请先简要分析用户意图（一行），然后输出重写后的查询。\n"
-            f"格式:\n"
-            f"分析: ...\n"
-            f"重写: ..."
+            f"请直接输出重写后的查询，不要额外解释。\n重写："
         )
-
         try:
             response = self.eval_llm.invoke(prompt).strip()
-            rewritten_query = ""
             if "重写:" in response:
-                rewritten_query = response.split("重写:", 1)[1].strip()
+                response = response.split("重写:", 1)[1].strip()
             elif "重写：" in response:
-                rewritten_query = response.split("重写：", 1)[1].strip()
-            else:
-                lines = response.split('\n')
-                rewritten_query = lines[-1].strip()
-            
-            rewritten_query = rewritten_query.strip('"\'')
-            logger.info(f"🧠 [语义重写] 原问：'{question}' -> 新意：'{rewritten_query}'")
-            return rewritten_query
-            
+                response = response.split("重写：", 1)[1].strip()
+            return response.strip('"\'')
         except Exception as e:
             logger.warning(f"语义重写失败，回退到原问题：{e}")
             return question
 
     def _generate_multi_queries_parallel(self, question: str, n: int = 1) -> List[str]:
-        base_prompt = (
-            f"你是一个检索专家。请基于用户关于《遥远的救世主》的问题，生成一个不同角度的检索查询。\n"
-            f"用户问题：{question}\n"
-            f"请直接输出查询语句，不要额外解释："
-        )
-        
+        base_prompt = f"你是一个检索专家。请基于用户关于《遥远的救世主》的问题，生成一个不同角度的检索查询。\n用户问题：{question}\n请直接输出查询语句，不要额外解释："
         queries = []
-        with ThreadPoolExecutor(max_workers=n) as executor:
+        max_workers = min(n, 5) 
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(self.llm.invoke, base_prompt) for _ in range(n)]
             for future in as_completed(futures):
                 try:
                     resp = future.result().strip()
-                    if resp:
-                        queries.append(resp)
+                    if resp: queries.append(resp)
                 except Exception as e:
                     logger.warning(f"并行生成查询失败：{e}")
         
         queries = list(dict.fromkeys(queries))
-        if question not in queries:
-            queries.append(question)
-            
-        logger.info(f"🔍 [并行 Multi-Query] 生成变体：{queries}")
+        if question not in queries: queries.append(question)
         return queries[:n+1]
 
-    def _rerank_docs(self, query: str, docs: List[Document]) -> List[Document]:
+    def _rerank_docs(self, query: str, docs: List[Document], top_k_final: int) -> List[Document]:
         if not self.reranker or not docs:
-            return docs
+            return docs[:top_k_final]
         
         logger.info(f"🔍 正在对 {len(docs)} 个片段进行 Rerank...")
         pairs = [[query, doc.page_content] for doc in docs]
         
         try:
-            scores = self.reranker.predict(
-                pairs, 
-                convert_to_numpy=True, 
-                show_progress_bar=False,
-                batch_size=32
-            )
-            
-            if hasattr(scores, 'tolist'):
-                scores = scores.tolist()
-            elif not isinstance(scores, list):
-                scores = [float(scores)] * len(docs)
-            
-            if isinstance(scores, (int, float)):
-                scores = [scores] * len(docs)
-            elif hasattr(scores, 'tolist'):
-                scores = scores.tolist()
+            scores = self.reranker.predict(pairs, convert_to_numpy=True, show_progress_bar=False, batch_size=32)
+            if hasattr(scores, 'tolist'): scores = scores.tolist()
+            elif not isinstance(scores, list): scores = [float(scores)] * len(docs)
             
             for i, doc in enumerate(docs):
-                doc.metadata['rerank_score'] = scores[i]
+                doc.metadata['rerank_score'] = scores[i] if isinstance(scores, list) else float(scores)
             
             ranked_docs = sorted(docs, key=lambda x: x.metadata.get('rerank_score', 0), reverse=True)
-            logger.info(f"✅ Rerank 完成。最高分：{ranked_docs[0].metadata['rerank_score']:.4f}")
-            return ranked_docs[:self.top_k_final] 
+            return ranked_docs[:top_k_final] 
         except Exception as e:
             logger.error(f"Rerank 出错：{e}, 返回原始顺序。")
-            return docs
+            return docs[:top_k_final]
 
-    def _evaluate_retrieval_quality(self, question: str, docs: List[Document]) -> bool:
+    def _build_context_and_metrics(self, final_docs, question, timer):
+        """✅ 优化点：批量计算 Embedding，消除 N+1 问题"""
+        context_evidence = []
+        timer.checkpoint("Context_Embedding_Start") 
+        
+        try:
+            # 1. 只计算一次 Question 向量
+            q_vec = self.embeddings.embed_query(question)
+            
+            # 2. 批量计算所有 Document 向量
+            doc_contents = [d.page_content for d in final_docs]
+            d_vecs = self.embeddings.embed_documents(doc_contents)
+            
+            # 3. 批量计算余弦相似度
+            similarities = cosine_similarity([q_vec], d_vecs)[0]
+        except Exception as e:
+            logger.warning(f"批量嵌入计算失败：{e}")
+            similarities = [0.0] * len(final_docs)
+        
+        for i, d in enumerate(final_docs):
+            score = similarities[i] if i < len(similarities) else 0.0
+            r_score = d.metadata.get('rerank_score', 0)
+            tag_label = "🔥[核心依据]" if r_score > 0.7 else "❄️[辅助参考]"
+            
+            self.last_retrieval_debug_info.append({
+                "index": i + 1, "content": d.page_content, "score": round(score, 4),
+                "rerank_score": round(r_score, 4), "chapter": d.metadata.get("chapter", "?"), "is_cited": False
+            })
+            
+            context_evidence.append(f"[依据 {i+1}] {tag_label} (章节:{d.metadata.get('chapter', '?')} | Rerank:{r_score:.2f}):\n{d.page_content}")
+        
+        timer.checkpoint("Context_Building_Done") 
+        return "\n\n---\n\n".join(context_evidence)
+
+    def _generate_response_stream(self, context_text, question):
+        prompt_text = self.PROMPT_GENERATION_TEMPLATE.format(context=context_text, question=question)
+        collector = StreamingResponseCollector(self.llm, prompt_text)
+        return collector, collector.generate(question)
+
+    # ==========================================
+    # 新增：无模型快速过滤器 (Model-Free Fast Filter)
+    # ==========================================
+    def _fast_keyword_filter(self, question: str, docs: List[Document]) -> Optional[bool]:
+        """
+        基于关键词匹配分数的快速预评估。
+        返回 True (直接通过), False (直接失败), 或 None (需要 LLM 进一步评估)。
+        """
         if not docs:
             return False
         
-        top_doc = docs[0]
-        top_score = top_doc.metadata.get('rerank_score', 0)
+        # 尝试导入 jieba，如果没有安装则直接跳过此优化，降级为 LLM 评估
+        try:
+            import jieba
+        except ImportError:
+            logger.warning("⚠️ 未安装 jieba 库，跳过关键词快速过滤，直接使用 LLM 评估。请运行: pip install jieba")
+            return None
 
-        if top_score > 0.85:
-            logger.info(f"✅ Rerank 高分 ({top_score:.2f}) 直接通过评估。")
-            return True
-        
-        if top_score < 0.5:
-            logger.warning(f"⚠️ Rerank 分数 ({top_score:.2f}) 过低，直接判定失败。")
+        try:
+            # 简单分词，去除停用词
+            stop_words = {"的", "了", "是", "在", "就", "都", "而", "及", "与", "着", "吗", "呢", "吧", "啊", "呀", "什么", "为什么", "如何"}
+            # 使用 lcut 进行分词
+            keywords = [w for w in jieba.lcut(question) if len(w) > 1 and w not in stop_words]
+            
+            if not keywords:
+                return None # 没有有效关键词，交给 LLM
+                
+            top_doc_content = docs[0].page_content.lower()
+            match_count = sum(1 for k in keywords if k in top_doc_content)
+            match_ratio = match_count / len(keywords)
+            
+            # 策略：
+            # 1. 如果超过 60% 的关键词都命中 -> 极大概率相关 -> 直接通过 (节省 LLM 调用)
+            if match_ratio >= 0.6:
+                logger.debug(f"⚡ [快速过滤] 关键词命中率 {match_ratio:.2f}，直接通过。")
+                return True
+            
+            # 2. 如果一个关键词都没命中 -> 极大概率无关 -> 直接失败 (触发重试)
+            if match_ratio == 0.0:
+                logger.debug(f"⚡ [快速过滤] 关键词命中率 0，直接拒绝。")
+                return False
+                
+            # 3. 否则 -> 模糊地带 -> 需要 LLM 评估
+            return None
+        except Exception as e:
+            logger.warning(f"⚠️ 关键词过滤执行出错 ({e})，降级为 LLM 评估。")
+            return None
+
+    # ==========================================
+    # 优化：带 CoT 的评估逻辑
+    # ==========================================
+    PROMPT_EVALUATE_COT_TEMPLATE = (
+        "你是一个严格的《遥远的救世主》研究助手。请判断【文档片段】是否包含回答【用户问题】所需的**实质性内容**。\n\n"
+        "## 用户问题\n{question}\n\n"
+        "## 文档片段 (Top 1)\n{doc_content}\n\n"
+        "## 任务要求\n"
+        "1. **分析**：首先思考文档中是否出现了问题中的关键实体、概念或情节？文档是否在讨论相关问题？\n"
+        "2. **判断**：只要文档对回答问题有**任何帮助**（哪怕只是提到概念），就视为相关。\n"
+        "3. **输出格式**：必须严格遵循以下 XML 格式，不要输出其他多余内容。\n"
+        "<reasoning>简要分析关键词匹配情况和语义相关性...</reasoning>\n"
+        "<decision>YES</decision> 或 <decision>NO</decision>\n\n"
+        "## 开始评估："
+    )
+
+    def _evaluate_retrieval_quality(self, question: str, docs: List[Document]) -> bool:
+        """
+        ✅ 优化版：混合过滤策略
+        1. 先尝试无模型关键词过滤 (提速)。
+        2. 若模糊，再调用小模型进行 CoT 评估 (提准)。
+        """
+        if not docs:
             return False
         
-        logger.info(f"🤔 Rerank 分数 ({top_score:.2f}) 中等，启动小模型辅助评估...")
+        # 步骤 1: 无模型快速过滤
+        fast_result = self._fast_keyword_filter(question, docs)
+        if fast_result is not None:
+            # 记录日志以便监控跳过了多少次 LLM 调用
+            logger.info(f"🛡️ [自检] 快速过滤结果：{'通过' if fast_result else '失败'} (跳过 LLM 评估)")
+            return fast_result
         
-        prompt = (
-            f"你是一个严格的评估助手。请判断给定的【文档片段】是否包含与【用户问题】相关的**实质性内容**。\n"
-            f"注意：不需要片段直接给出完美定义，只要片段中**讨论、提及或解释**了问题中的核心概念，即可视为相关。\n"
-            f"用户问题：{question}\n"
-            f"文档片段 (Top 1): {top_doc.page_content[:300]}...\n"
-            f"如果片段与问题相关（哪怕只是部分相关），输出 'YES'。\n"
-            f"如果片段完全无关或只是在标题中提到但没有实质内容，输出 'NO'。\n"
-            f"只输出 YES 或 NO。"
+        # 步骤 2: LLM CoT 评估 (仅在模糊时调用)
+        top_doc = docs[0]
+        prompt = self.PROMPT_EVALUATE_COT_TEMPLATE.format(
+            question=question,
+            doc_content=top_doc.page_content[:600] # 稍微多给一点上下文供推理
         )
         
         try:
-            resp = self.eval_llm.invoke(prompt).strip().upper()
-            logger.debug(f"评估模型响应：{resp}")
+            logger.info("🧠 [自检] 进入 CoT 深度评估模式...")
+            response = self.eval_llm.invoke(prompt).strip()
             
-            if 'NO' in resp:
-                logger.warning("⚠️ 评估模型判定不相关，触发重试。")
-                return False
-            else:
-                logger.info("✅ 评估模型判定相关。")
-                return True
-                
+            # 解析 CoT 结果
+            decision = "NO" # 默认失败
+            if "<decision>" in response:
+                decision_content = response.split("<decision>", 1)[1].split("</decision>", 1)[0].strip().upper()
+                if "YES" in decision_content:
+                    decision = "YES"
+                elif "NO" in decision_content:
+                    decision = "NO"
+            elif "YES" in response.upper():
+                # 兜底：如果没有标签但包含了 YES
+                decision = "YES"
+            
+            is_relevant = (decision == "YES")
+            logger.info(f"🛡️ [自检] CoT 评估结论：{'通过' if is_relevant else '失败'}")
+            # 可选：打印 reasoning 用于调试
+            # if "<reasoning>" in response:
+            #     reason = response.split("<reasoning>", 1)[1].split("</reasoning>", 1)[0]
+            #     logger.debug(f"   推理过程：{reason}")
+            
+            return is_relevant
+            
         except Exception as e:
-            logger.error(f"评估模型调用失败：{e}，保守起见返回 True。")
-            return True 
+            logger.warning(f"评估模型调用失败，保守策略：默认通过。错误：{e}")
+            return True
 
-    def query(self, question: str, k: int = 5):
+
+    def _post_process_response(self, full_response, context_text, question, timer):
+        """✅ 优化点：移除耗时的同步 LLM 重写，仅做标记"""
+        def count_citations(text: str):
+            indices = set()
+            pattern = r'[\[\(【](?:依据 | 参考)?\s*:?\s*(\d+)[\]\)】]'
+            matches = re.findall(pattern, text)
+            for m in matches:
+                try: 
+                    idx = int(m)
+                    if 1 <= idx <= len(self.last_retrieval_debug_info):
+                        indices.add(idx)
+                except ValueError: pass
+            return indices, len(indices)
+
+        cited_indices, cited_count = count_citations(full_response)
+        needs_retry = (cited_count == 0 and len(self.last_retrieval_debug_info) > 0)
+        
+        if needs_retry:
+            logger.warning("⚠️ [自检警告] 生成结果缺少引用。为避免延迟，跳过 LLM 重写步骤，仅添加系统注记。")
+            # 不再调用 LLM 重写，直接加注记
+            full_response += "\n\n> ⚠️ **系统注**: 本次回答未能自动标注原文引用，请人工核对上下文。"
+        
+        for item in self.last_retrieval_debug_info:
+            if item["index"] in cited_indices:
+                item["is_cited"] = True
+        
+        return full_response, cited_count, cited_indices, needs_retry
+
+    def query(self, question: str, **kwargs):
         """
-        主查询流程 (带细粒度性能埋点)
+        主查询入口 (Self-RAG 优化版)
+        逻辑：
+        1. 尝试检索 -> 评估。
+        2. 若失败且还有重试次数 -> 降级重试 (单路 + 放宽 TopK)。
+        3. 生成 -> 后处理 (仅标记，不重试生成)。
         """
-        # 🆕 初始化计时器
+        params = {**self.default_params, **kwargs}
+        rewrite_mode = params.get('rewrite_mode', 'deep')
+        top_k_initial = params['top_k_initial']
+        top_k_final = params['top_k_final']
+        multi_query_count = params['multi_query_count']
+        max_attempts = params.get('max_self_rag_attempts', 1)
+
+        logger.info(f"🎛️ [本次配置] K_init={top_k_initial}, Mode={rewrite_mode}, Max_Retry={max_attempts}")
+
         timer = PipelineTimer()
         timer.checkpoint("Start")
 
@@ -469,319 +676,165 @@ class RAGEngine:
             return
 
         self.last_retrieval_debug_info = []
-        attempt = 0
         final_docs = []
-        
-        # === Self-RAG 循环 ===
-        while attempt <= self.max_self_rag_attempts:
-            logger.info(f"🔄 [Self-RAG 尝试 {attempt+1}]")
-            
-            current_queries = []
-            if attempt == 0:
-                # 1. 语义重写
-                timer.checkpoint(f"Attempt_{attempt+1}_Start")
-                rewritten_deep = self._rewrite_query(question) 
-                timer.checkpoint(f"Attempt_{attempt+1}_Rewrite")
-                
-                # 2. 并行生成 Multi-Query
-                multi_vars = self._generate_multi_queries_parallel(question, n=1)
-                timer.checkpoint(f"Attempt_{attempt+1}_MultiQuery_Gen")
-                
-                current_queries = list(dict.fromkeys([question, rewritten_deep] + multi_vars))
-                logger.info(f"📢 [广度模式] 执行 {len(current_queries)} 路检索：{current_queries}")
-            else:
-                hint = "之前的检索结果不够精准，请尝试从书中核心理论、人物对话或具体情节的角度重新表述查询。"
-                deep_rewrite = self._rewrite_query(question, history_context=hint)
-                timer.checkpoint(f"Attempt_{attempt+1}_Rewrite_Retry")
-                current_queries = [deep_rewrite]
-                logger.info(f"📢 [深度模式] 重试聚焦检索：{deep_rewrite}")
+        retry_overhead_seconds = 0.0 
+        attempt = 0
+        success_eval = False
 
-            all_docs = []
-            seen_content = set()
+        # === Self-RAG 循环 (带智能降级) ===
+        while attempt <= max_attempts and not success_eval:
+            is_retry = (attempt > 0)
+            logger.info(f"🔄 [尝试 {attempt + 1}/{max_attempts + 1}] {'(降级重试)' if is_retry else '(初始检索)'}")
             
-            # 3. 并行检索
-            def retrieve_single_query(q):
-                try:
-                    if self.hybrid_retriever:
-                        return self.hybrid_retriever.invoke(q)
+            try:
+                # 1. 准备查询 (重试时简化逻辑)
+                if is_retry:
+                    # ✅ 智能降级：重试时不再生成多路查询，直接使用原问题，避免耗时翻倍
+                    current_queries = [question]
+                    logger.info("⚡ [降级策略] 重试模式：禁用多路查询，直接使用原问题。")
+                    # 可选：重试时稍微放宽一点初始召回数量，增加命中率
+                    current_top_k = min(int(top_k_initial * 1.5), 20) 
+                else:
+                    rewritten_query = self._rewrite_query(question, mode=rewrite_mode) 
+                    timer.checkpoint("Query_Rewrite")
+                    
+                    if rewrite_mode != 'direct' and multi_query_count > 0:
+                        multi_vars = self._generate_multi_queries_parallel(question, n=multi_query_count)
+                        timer.checkpoint("MultiQuery_Gen")
+                        current_queries = list(dict.fromkeys([question, rewritten_query] + multi_vars))
                     else:
-                        return self.vector_store.similarity_search(q, k=self.top_k_initial)
-                except Exception as e:
-                    logger.warning(f"查询 '{q}' 检索失败：{e}")
-                    return []
+                        current_queries = [rewritten_query if rewritten_query else question]
+                    current_top_k = top_k_initial
 
-            with ThreadPoolExecutor(max_workers=len(current_queries)) as executor:
-                futures = {executor.submit(retrieve_single_query, q): q for q in current_queries}
-                for future in as_completed(futures):
-                    docs = future.result()
-                    for doc in docs:
-                        if doc.page_content not in seen_content:
-                            seen_content.add(doc.page_content)
-                            all_docs.append(doc)
-            
-            timer.checkpoint(f"Attempt_{attempt+1}_Parallel_Retrieval")
-
-            if not all_docs:
-                attempt += 1
-                continue
+                # 2. 并行检索
+                all_docs = []
+                seen_content = set()
                 
-            logger.info(f"📦 合并后去重文档总数：{len(all_docs)}")
-            
-            # 4. Rerank
-            ranked_docs = self._rerank_docs(question, all_docs)
-            timer.checkpoint(f"Attempt_{attempt+1}_Rerank")
-            
-            # 5. 质量评估
-            if self._evaluate_retrieval_quality(question, ranked_docs):
-                final_docs = ranked_docs
-                timer.checkpoint(f"Attempt_{attempt+1}_Eval")
-                logger.info("✅ 检索质量评估通过。")
+                def retrieve_single_query(q):
+                    try:
+                        if self.hybrid_retriever:
+                            old_k = self.hybrid_retriever.k
+                            self.hybrid_retriever.k = current_top_k
+                            res = self.hybrid_retriever.invoke(q)
+                            self.hybrid_retriever.k = old_k
+                            return res
+                        else:
+                            return self.vector_store.similarity_search(q, k=current_top_k)
+                    except Exception as e:
+                        logger.warning(f"查询 '{q}' 检索失败：{e}")
+                        return []
+
+                with ThreadPoolExecutor(max_workers=len(current_queries)) as executor:
+                    futures = {executor.submit(retrieve_single_query, q): q for q in current_queries}
+                    for future in as_completed(futures):
+                        docs = future.result()
+                        for doc in docs:
+                            if doc.page_content not in seen_content:
+                                seen_content.add(doc.page_content)
+                                all_docs.append(doc)
+                
+                timer.checkpoint("Parallel_Retrieval")
+
+                # 3. Rerank
+                if all_docs:
+                    ranked_docs = self._rerank_docs(question, all_docs, top_k_final)
+                    timer.checkpoint("Rerank")
+                    final_docs = ranked_docs
+                else:
+                    final_docs = []
+                
+                # 4. 评估 (Self-RAG 核心)
+                if final_docs:
+                    success_eval = self._evaluate_retrieval_quality(question, final_docs)
+                    timer.checkpoint("Eval_Phase")
+                    
+                    if not success_eval and attempt < max_attempts:
+                        logger.warning("❌ 评估未通过，准备重试...")
+                        attempt += 1
+                        retry_overhead_seconds += timer.get_total_time() - sum(timer.get_stages().values()) # 粗略估算
+                        continue # 进入下一轮循环
+                    elif not success_eval:
+                        logger.warning("❌ 评估未通过且已达最大重试次数，强制继续生成。")
+                else:
+                    if attempt < max_attempts:
+                        attempt += 1
+                        continue
+                    else:
+                        logger.warning("❌ 无检索结果且已达最大重试次数。")
+
+            except Exception as e:
+                logger.error(f"检索阶段发生异常：{e}")
+                if attempt < max_attempts:
+                    attempt += 1
+                    continue
+                final_docs = []
                 break
-            else:
-                logger.info("❌ 检索质量评估未通过，准备重试...")
-                timer.checkpoint(f"Attempt_{attempt+1}_Eval_Failed")
-                attempt += 1
-        
-        end_retrieval_time = time.time()
+            
+            break # 成功或放弃，退出循环
+
         timer.checkpoint("Retrieval_Phase_Done")
         
         if not final_docs:
-            yield "⚠️ 经过多次检索与反思，仍未找到足够的原文依据来回答这个问题。"
-            metrics = {
-                "status": "failed",
-                "latency_seconds": timer.get_total_time(),
-                "stage_durations": timer.get_stages(),
-                "self_rag_attempts": attempt + 1,
-                "total_retrieved": 0,
-                "cited_count": 0,
-                "citation_rate": 0.0
+            yield "⚠️ 经过多次检索与评估，未找到足够的原文依据来回答这个问题。"
+            self.metrics = {
+                "status": "failed", "latency_seconds": round(timer.get_total_time(), 2),
+                "stage_durations": timer.get_stages(), "total_retrieved": 0, "cited_count": 0,
+                "config_snapshot": params, "attempts_made": attempt + 1
             }
-            self._log_interaction(question, "", metrics)
+            self._log_interaction(question, "", self.metrics)
             return
 
-        # === 构建上下文 ===
-        context_evidence = []
-        for i, d in enumerate(final_docs):
-            score = 0.0
-            try:
-                q_vec = self.embeddings.embed_query(question)
-                d_vec = self.embeddings.embed_documents([d.page_content])[0]
-                score = float(cosine_similarity([q_vec], [d_vec])[0][0])
-            except: pass
-            
-            r_score = d.metadata.get('rerank_score', 0)
-            tag_label = "🔥[核心依据]" if r_score > 0.7 else "❄️[辅助参考]"
-            
-            self.last_retrieval_debug_info.append({
-                "index": i + 1,
-                "content": d.page_content,
-                "score": round(score, 4),
-                "rerank_score": round(r_score, 4),
-                "chapter": d.metadata.get("chapter", "?"),
-                "is_cited": False
-            })
-            
-            context_evidence.append(
-                f"[依据 {i+1}] {tag_label} (章节:{d.metadata.get('chapter', '?')} | Rerank:{r_score:.2f}):\n{d.page_content}"
-            )
+        # 5. 构建上下文 (使用批量 Embedding)
+        context_text = self._build_context_and_metrics(final_docs, question, timer)
         
-        context_text = "\n\n".join(context_evidence)
-        timer.checkpoint("Context_Building")
-        
-        system_instruction_template = """
-# Role: 资深文化分析师 (擅长结构化深度解读)
-你的任务是基于【参考上下文】，对用户关于《遥远的救世主》的问题进行**深度、结构化**的分析。
-
-## ⚠️ 核心指令 (必须严格执行)
-
-1. **结构化输出格式 (最重要)**:
-   - 你的回答必须是一篇**排版精美**的文章，严格遵循以下 Markdown 结构：
-     - 使用 `###` 作为主标题 (概括核心观点)。
-     - 使用 `####` 作为分论点标题。
-     - 使用 **加粗** (`**文字**`) 强调关键概念和结论。
-     - 使用 `-` 列表项来罗列具体论据或步骤。
-     - 适当使用 `> 引用块` 来展示书中的原话。
-   - **禁止**输出大段没有任何标点和分段的纯文本。
-
-2. **密集且规范的引用 (格式严格)**:
-   - **每一句话或每一个分论点后**，只要涉及原文内容，必须标注 `[依据 X]`。
-   - **❗️重要格式要求**：在 `[依据 X]` 前面**必须加一个空格**，与前面的文字隔开。
-   - ✅ 正确示例："...规律 [依据 1]"、"...工具 [依据 2]"。
-   - ❌ 错误示例："...规律 [依据 1]" (缺少空格)。
-   - 标签格式严格为：`[依据 1]`, `[依据 2]`。
-
-3. **⚡️ 高效表达 (关键)**:
-   - **拒绝注水**：不要写长篇大论的背景介绍或过渡句，直接输出核心观点。
-   - **句式紧凑**：每个分论点严格控制在 **3-4 句话** 内 (观点 + 证据 + 解析)。
-   - **字数控制**：全文尽量控制在 **800 字** 以内，说完即止。
-
-## 参考上下文
-{context}
-
-## 用户问题
-{question}
-
-## 你的回答 (请严格按照上述结构化格式撰写):
-"""
-
-        prompt_text = system_instruction_template.format(context=context_text, question=question)
-        
+        # 6. LLM 生成
         logger.info("📝 开始生成并自我反思...")
-        full_response = ""
+        yield "💡 正在深度推演...\n\n"
         
+        full_response = ""
         try:
-            yield "💡 正在深度推演...\n\n"
-            stream_generator = self.llm.stream(prompt_text)
+            collector, stream_gen = self._generate_response_stream(context_text, question)
             
-            # 🛡️ 状态机变量
-            first_line_processed = False
-            first_line_buffer = ""
-            MAX_FIRST_LINE_LEN = 80  # 如果第一行超过80字符还没换行，强制截断处理
-            
-            for chunk in stream_generator:
-                if not chunk:
-                    continue
-                
-                # === 阶段 1: 第一行尚未处理完毕 ===
-                if not first_line_processed:
-                    first_line_buffer += chunk
-                    
-                    # 触发条件 A: 遇到换行符
-                    # 触发条件 B: 缓冲区长度超过阈值 (防止模型不换行导致卡死或误判)
-                    should_process = False
-                    if '\n' in first_line_buffer:
-                        should_process = True
-                    elif len(first_line_buffer) >= MAX_FIRST_LINE_LEN:
-                        should_process = True
-                        logger.debug(f"⚠️ 第一行过长 ({len(first_line_buffer)} chars)，强制截断处理。")
-                    
-                    if should_process:
-                        first_line_processed = True
-                        
-                        # 分割内容
-                        if '\n' in first_line_buffer:
-                            parts = first_line_buffer.split('\n', 1)
-                            line = parts[0]
-                            remainder = parts[1]
-                        else:
-                            # 没有换行符，整段作为 line，remainder 为空
-                            line = first_line_buffer
-                            remainder = ""
-                        
-                        clean_line = line.strip()
-                        
-                        # 🔍 去重判断逻辑
-                        # 1. 提取纯文本 (去掉 #)
-                        title_text = re.sub(r'^#+\s*', '', clean_line).strip()
-                        
-                        # 2. 清洗问题 (去掉标点)
-                        q_clean = re.sub(r'[?？,.，!！:\:]', '', question).strip()
-                        t_clean = re.sub(r'[?？,.，!！:\:]', '', title_text).strip()
-                        
-                        is_duplicate = False
-                        
-                        # 只有当提取出的文本长度大于 2 时才进行比对 (避免误杀短词)
-                        if len(q_clean) > 2 and len(t_clean) > 2:
-                            # 规则 A: 完全相等
-                            if q_clean == t_clean:
-                                is_duplicate = True
-                            # 规则 B: 包含且长度接近 (防止 "问题：什么是天道" vs "什么是天道")
-                            elif (q_clean in t_clean or t_clean in q_clean) and abs(len(q_clean) - len(t_clean)) < 5:
-                                is_duplicate = True
-                            # 规则 C: 高重合度
-                            else:
-                                set_q = set(q_clean)
-                                set_t = set(t_clean)
-                                if len(set_q) > 0:
-                                    overlap = len(set_q & set_t) / len(set_q)
-                                    if overlap > 0.85:
-                                        is_duplicate = True
-                        
-                        if is_duplicate:
-                            logger.info(f"🧹 [拦截] 丢弃重复/无效首行: '{clean_line[:50]}...'")
-                            # 丢弃该行。如果有剩余内容 (remainder)，直接输出
-                            if remainder:
-                                yield remainder
-                        else:
-                            logger.info(f"✅ [保留] 有效首行: '{clean_line[:50]}...'")
-                            # 保留该行。输出时确保 Markdown 格式正确 (标题后加双换行)
-                            # 如果原行没有换行符 (因为是长度截断的)，我们需要补一个
-                            output_line = line
-                            if not line.endswith('\n'):
-                                output_line += "\n"
-                            
-                            yield output_line + "\n" # 确保标题后有空白行
-                            if remainder:
-                                yield remainder
-                
-                # === 阶段 2: 第一行已处理，后续所有字符直接透传 ===
-                else:
+            for chunk in stream_gen:
+                if chunk:
                     yield chunk
-
-            # === 兜底：如果流结束了，第一行还没处理 (极罕见情况) ===
-            if not first_line_processed and first_line_buffer:
-                line = first_line_buffer.strip()
-                # 复用上面的去重逻辑 (简化版)
-                title_text = re.sub(r'^#+\s*', '', line).strip()
-                q_clean = re.sub(r'[?？,.，!！]', '', question).strip()
-                t_clean = re.sub(r'[?？,.，!！]', '', title_text).strip()
-                
-                is_duplicate = (len(q_clean) > 2 and len(t_clean) > 2) and (
-                    q_clean == t_clean or 
-                    ((q_clean in t_clean or t_clean in q_clean) and abs(len(q_clean) - len(t_clean)) < 5)
-                )
-                
-                if not is_duplicate:
-                    yield line + "\n\n"
-                # 否则静默丢弃
-
+            
+            full_response = collector.full_response
+            
         except Exception as e:
             logger.error(f"生成流异常：{e}")
             yield f"\n\n❌ 生成中断：{str(e)}"
             return
 
         timer.checkpoint("LLM_Generation")
+        
+        # 7. 后处理 (仅检查，不重试生成)
+        full_response, cited_count, cited_indices, needs_retry = self._post_process_response(full_response, context_text, question, timer)
+        
+        # 8. 组装 Metrics
         total_latency = timer.get_total_time()
+        current_stages = timer.get_stages()
+        if retry_overhead_seconds > 0.1: current_stages['Retry_Overhead'] = round(retry_overhead_seconds, 4)
 
-        # === 后处理统计 ===
-        cited_indices = set()
-        pattern = r'[\[(](?:依据 | 参考)?\s*:?\s*(\d+)[\])]'
-        
-        matches = re.findall(pattern, full_response)
-        for m in matches:
-            try: 
-                idx = int(m)
-                if 1 <= idx <= len(self.last_retrieval_debug_info):
-                    cited_indices.add(idx)
-            except ValueError:
-                pass
-        
-        for item in self.last_retrieval_debug_info:
-            if item["index"] in cited_indices:
-                item["is_cited"] = True
-        
+        recorded_sum = sum(current_stages.values())
+        missing_time = total_latency - recorded_sum
+        if missing_time > 0.5:
+            current_stages['Untracked_Overhead'] = round(missing_time, 4)
+
         total_retrieved = len(self.last_retrieval_debug_info)
-        cited_count = len(cited_indices)
         citation_rate = cited_count / total_retrieved if total_retrieved > 0 else 0
         
-        logger.info(f"[RAGAS 模拟] 检索数:{total_retrieved}, 引用数:{cited_count}, 覆盖率:{citation_rate:.2%}")
-
-        if not cited_indices and total_retrieved > 0:
-            logger.warning("⚠️ 警告：模型未引用任何片段，可能存在幻觉风险！")
-
-        # 🆕 组装包含详细阶段耗时的 Metrics
-        metrics = {
-            "status": "success",
-            "latency_seconds": round(total_latency, 2),
-            "stage_durations": timer.get_stages(), # 新增：详细阶段耗时
-            "retrieval_latency": round(timer.stages.get("Retrieval_Phase_Done", 0), 2),
-            "generation_latency": round(timer.stages.get("LLM_Generation", 0), 2),
-            "self_rag_attempts": attempt + 1,
+        self.metrics = {
+            "status": "success", "latency_seconds": round(total_latency, 2),
+            "stage_durations": current_stages, 
+            "active_params": params,  # 这里的 params 是 query 方法入口处合并了默认值和 kwargs 后的最终字典
+            "retrieval_latency": round(current_stages.get("Retrieval_Phase_Done", 0), 2),
+            "generation_latency": round(current_stages.get("LLM_Generation", 0), 2),
             "total_retrieved": total_retrieved,
-            "cited_count": cited_count,
-            "citation_rate": round(citation_rate, 4),
+            "cited_count": cited_count, "citation_rate": round(citation_rate, 4),
             "top_rerank_score": round(final_docs[0].metadata.get('rerank_score', 0), 4) if final_docs else 0,
-            "noise_ratio": round(1 - citation_rate, 4)
+            "noise_ratio": round(1 - citation_rate, 4), "retry_triggered": (attempt > 0),
+            "attempts_made": attempt + 1,
+            "config_snapshot": params
         }
-
-        self._log_interaction(question, full_response, metrics)
+        self._log_interaction(question, full_response, self.metrics)
