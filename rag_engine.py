@@ -3,13 +3,15 @@ import json
 import logging
 import re
 import time
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Iterator
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # LangChain & AI libs
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
+# ✅ 改用本地文件存储，实现持久化
+from langchain_core.documents import Document
 from langchain_ollama import OllamaLLM
 from langchain_huggingface import HuggingFaceEmbeddings
 from sentence_transformers import CrossEncoder
@@ -22,6 +24,80 @@ import numpy as np
 # Logger 配置
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+class LocalFileStore:
+    """
+    一个简单的本地文件存储实现，用于存储 Parent-Child 映射关系。
+    替代 langchain.storage.LocalFileStore 或 langchain_core.storage.BaseStore
+    """
+    def __init__(self, path: str):
+        self.path = path
+        os.makedirs(path, exist_ok=True)
+
+    def _get_path(self, key: str) -> str:
+        # 防止 key 中包含非法文件名字符
+        safe_key = key.replace("/", "_").replace("\\", "_").replace(":", "_")
+        return os.path.join(self.path, f"{safe_key}.json")
+
+    def mget(self, keys: List[str]) -> List[Optional[Any]]:
+        """批量获取"""
+        results = []
+        for key in keys:
+            path = self._get_path(key)
+            if os.path.exists(path):
+                try:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        # 假设存的是 Document 的 dict 形式，这里直接读出来
+                        # 如果存的是序列化后的 Document 对象，可能需要根据实际保存格式调整
+                        data = json.load(f)
+                        results.append(data)
+                except Exception:
+                    results.append(None)
+            else:
+                results.append(None)
+        return results
+
+    def mset(self, key_value_pairs: List[tuple]) -> None:
+        """批量设置"""
+        for key, value in key_value_pairs:
+            path = self._get_path(key)
+            try:
+                # 如果 value 是 Document 对象，通常需要序列化
+                # 但看你的代码逻辑，存入的是 p_doc (Document 对象)
+                # 我们需要确保它能被 json 序列化。
+                # 如果 Document 对象不能直接 json.dump，需要转换。
+                # 这里做一个简单的兼容处理：如果是 Document，转为 dict
+                
+                data_to_save = value
+                if hasattr(value, 'page_content'): # 判断是否是 Document 对象
+                    # 简单序列化 Document
+                    data_to_save = {
+                        "page_content": value.page_content,
+                        "metadata": value.metadata,
+                        "type": "Document" # 标记类型，方便以后还原（如果需要）
+                    }
+                
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(data_to_save, f, ensure_ascii=False)
+            except Exception as e:
+                logger.error(f"保存文档到本地存储失败 {key}: {e}")
+
+    def mdelete(self, keys: List[str]) -> None:
+        """批量删除"""
+        for key in keys:
+            path = self._get_path(key)
+            if os.path.exists(path):
+                os.remove(path)
+
+    def yield_keys(self, prefix: Optional[str] = None) -> Iterator[str]:
+        """遍历所有 key"""
+        if not os.path.exists(self.path):
+            return
+        for filename in os.listdir(self.path):
+            if filename.endswith(".json"):
+                key = filename[:-5] # 去掉 .json
+                if prefix is None or key.startswith(prefix):
+                    yield key
 
 # ==========================================
 # 工具类：Pipeline 性能计时器
@@ -192,20 +268,41 @@ class RAGEngine:
         
         # 默认参数 (允许前端覆盖)
         self.default_params = {
-            "top_k_initial": 8,      
-            "top_k_final": 3,
-            "max_self_rag_attempts": 0, # ✅ 建议默认改为 0，减少重试开销
-            "multi_query_count": 0,     # ✅ 建议默认改为 0，减少并发开销
-            "rerank_threshold": 0.5
+            "top_k_initial": 6,      
+            "top_k_final": 2,
+            "max_self_rag_attempts": 1, # 
+            "multi_query_count": 1,     # 
+            "rerank_threshold": 0.5,
+            "eval_top_k": 3  # ✅ 新增：评估时考察前 K 个文档            
         }
 
         self._load_models(embed_model_name, rerank_model_name, model_name, eval_model_name)
-        
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800, chunk_overlap=300, 
-            separators=["\n\n", "\n", "。", "！", "？", "；", "……", " ", ""]
+
+        # ✅ 修改点 1: 定义父子切分器
+        # 父文档：保持完整语境 (约 2000 字)
+        self.parent_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=2000, 
+            chunk_overlap=200, 
+            separators=["\n\n", "\n", "。", "！", "？"]
         )
+        # 子文档：用于精准检索 (约 400 字)
+        self.child_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=400, 
+            chunk_overlap=50, 
+            separators=["\n\n", "\n", "。", "！", "？"]
+        )
+
+        # ✅ 修改点 2: 初始化文档存储 (LocalFileStore 持久化到 ./doc_store 目录)
+        # 这样重启后无需重新生成摘要和父子映射
+        self.doc_store = LocalFileStore("./doc_store")
+        
+        # 标记是否已构建父子索引
+        self.parent_child_index_built = False
+
+        # 原有的 text_splitter 不再直接用于最终检索，但可保留用于兼容或调试
+        self.text_splitter = self.child_splitter 
         self.chapter_pattern = re.compile(r'第\s*(\d+|[一二三四五六七八九十百]+)\s*章')
+        
 
     def _load_models(self, embed_name, rerank_name, llm_name, eval_llm_name):
         logger.info(f"正在加载 Embedding 模型：{embed_name} ...")
@@ -261,30 +358,89 @@ class RAGEngine:
 
     def _init_hybrid_retriever(self):
         if not self.vector_store: return
-        logger.info("构建混合检索器 (BM25 + Vector)...")
+        
+        logger.info("构建自定义父子文档检索器 (Manual Parent-Child Mapping)...")
         try:
-            all_docs_data = self.vector_store.get(include=["metadatas", "documents"])
-            if not all_docs_data['documents']: return
+            # 1. 获取所有子文档用于构建 BM25
+            all_data = self.vector_store.get(include=["metadatas", "documents"])
+            if not all_data['documents']:
+                logger.warning("向量库为空，无法构建检索器。")
+                return
 
-            docs_obj = [Document(page_content=c, metadata=m) for c, m in zip(all_docs_data['documents'], all_docs_data['metadatas'])]
+            sub_docs = [Document(page_content=c, metadata=m) for c, m in zip(all_data['documents'], all_data['metadatas'])]
             
-            bm25_retriever = BM25Retriever.from_documents(docs_obj)
-            bm25_retriever.k = self.default_params["top_k_initial"]
+            # 2. 创建 BM25 检索器 (基于子文档)
+            bm25_retriever = BM25Retriever.from_documents(sub_docs)
+            bm25_retriever.k = self.default_params["top_k_initial"] * 2
             
-            vector_retriever = self.vector_store.as_retriever(
-                search_type="mmr", 
-                search_kwargs={"k": self.default_params["top_k_initial"], "fetch_k": 100, "lambda_mult": 0.5}
+            # 3. ✅ 创建自定义的向量检索器 (替代 ParentDocumentRetriever)
+            # 逻辑：先检索子文档，然后根据 parent_id 从 doc_store 加载父文档
+            vector_store_retriever = self.vector_store.as_retriever(
+                search_kwargs={"k": self.default_params["top_k_initial"]}
             )
             
-            self.hybrid_retriever = SimpleEnsembleRetriever(
-                retrievers=[bm25_retriever, vector_retriever],
-                weights=[0.7, 0.3], 
-                k=self.default_params["top_k_initial"] 
+            # 4. ✅ 包装成一个能自动返回父文档的检索器
+            class ParentChildWrapper(BaseRetriever):
+                vector_retriever: BaseRetriever
+                doc_store: Any
+                k: int = 8
+                
+                def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
+                    # A. 先检索子文档
+                    sub_docs = self.vector_retriever.invoke(query)
+                    
+                    # B. 提取唯一的 parent_id
+                    parent_ids = set()
+                    for doc in sub_docs:
+                        pid = doc.metadata.get("parent_id")
+                        if pid:
+                            parent_ids.add(pid)
+                    
+                    # C. 从 doc_store 批量加载父文档
+                    parent_docs = []
+                    seen_parents = set()
+                    for pid in parent_ids:
+                        if pid not in seen_parents:
+                            raw_data = self.doc_store.mget([pid])[0]
+                            if raw_data:
+                                # ✅ 重要：如果读出来是 dict，需还原为 Document 对象
+                                if isinstance(raw_data, dict) and "page_content" in raw_data:
+                                    from langchain_core.documents import Document
+                                    p_doc = Document(
+                                        page_content=raw_data.get("page_content", ""),
+                                        metadata=raw_data.get("metadata", {})
+                                    )
+                                else:
+                                    p_doc = raw_data # 已经是 Document 对象或其他
+                                parent_docs.append(p_doc)
+                                seen_parents.add(pid)
+                    
+                    # D. 如果没有找到父文档（极端情况），降级返回子文档
+                    if not parent_docs:
+                        logger.warning("未找到父文档，降级返回子文档。")
+                        return sub_docs[:self.k]
+                    
+                    # E. 返回父文档 (限制数量)
+                    return parent_docs[:self.k]
+
+            # 实例化包装器
+            vector_parent_retriever = ParentChildWrapper(
+                vector_retriever=vector_store_retriever,
+                doc_store=self.doc_store,
+                k=self.default_params["top_k_initial"]
             )
-            logger.info("✅ 混合检索器就绪。")
+            
+            # 5. ✅ 最终策略：只使用这个自定义的父子检索器
+            # (如果你非常想混合 BM25，可以把 vector_parent_retriever 和 bm25_retriever 传入 SimpleEnsembleRetriever)
+            # 但为了稳定性，这里先只用向量检索的父子模式
+            self.hybrid_retriever = vector_parent_retriever
+            
+            logger.info("✅ 自定义父子文档检索器就绪 (手动映射父文档)。")
+            
         except Exception as e:
-            logger.error(f"混合检索器初始化失败：{e}")
-            self.hybrid_retriever = None
+            logger.error(f"检索器初始化失败：{e}")
+            # 降级方案：直接返回向量库检索子文档
+            self.hybrid_retriever = self.vector_store.as_retriever(search_kwargs={"k": self.default_params["top_k_initial"]})
 
     def _load_text_content(self):
         if not os.path.exists(self.txt_path):
@@ -301,46 +457,204 @@ class RAGEngine:
         raise ValueError(f"无法读取文件。")
 
     def _process_and_embed(self):
-        start_index = self._load_checkpoint()
-        batch_size = 5000
-        total_length = len(self.full_text)
-        current_index = start_index
-        current_chapter = "序言"
+        """
+        ✅ 支持断点续传的父子文档索引构建
+        """
+        logger.info("🚀 开始构建父子文档索引与摘要元数据...")
         
-        while current_index < total_length:
-            end_index = min(current_index + batch_size, total_length)
-            chunk_text = self.full_text[current_index:end_index]
-            current_chapter = self._get_current_chapter(chunk_text, current_chapter)
-            docs = self.text_splitter.create_documents([chunk_text])
-            for doc in docs:
-                doc.metadata.update({"source": os.path.basename(self.txt_path), "start_char": current_index, "chapter": current_chapter})
+        # 1. 先按父文档粒度切分 (内存操作，很快)
+        parent_docs = self.parent_splitter.create_documents([self.full_text])
+        total_parents = len(parent_docs)
+        logger.info(f"共规划 {total_parents} 个父文档片段。")
+
+        # 2. 检查断点
+        start_index = self._load_checkpoint()
+        if start_index >= 0:
+            logger.info(f"📍 检测到断点：上次成功处理到索引 {start_index}。")
+            logger.info(f"⏩ 将从索引 {start_index + 1} 继续处理...")
+            # 验证 chroma_db 中是否真的有数据，防止文件不同步
+            current_count = self.vector_store._collection.count()
+            if current_count == 0:
+                logger.warning("⚠️ 警告：Checkpoint 存在但向量库为空！可能数据不一致，建议删除 checkpoint.json 后重试。")
+                # 这里选择保守策略：如果库为空，强制从头开始，避免数据错乱
+                start_index = -1
+            else:
+                # 跳过已处理的文档列表，节省内存
+                # 注意：parent_docs 是完整的，我们只是跳过循环
+                pass
+        else:
+            logger.info("🆕 未检测到有效断点，将从头开始构建。")
+            start_index = -1
+
+        docs_to_embed = []
+        total_children = 0
+        
+        # 如果是续传，我们需要知道之前已经生成了多少个子文档（可选，仅用于日志美观）
+        if start_index >= 0:
+            # 简单估算或直接设为 0，因为我们是追加写入 chroma
+            logger.info(f"之前已生成的子文档将保留在向量库中，本次仅追加新数据。")
+
+        # 3. 遍历父文档
+        for i, p_doc in enumerate(parent_docs):
+            # ✅ 断点续传核心：跳过已处理的索引
+            if i <= start_index:
+                continue
+
+            # --- 方案三：生成摘要元数据 ---
+            try:
+                logger.info(f"📝 [进度 {i+1}/{total_parents}] 正在为第 {i+1} 个父文档生成摘要...") 
+                
+                summary_prompt = (
+                    f"请阅读以下《遥远的救世主》片段，用一句话（30 字以内）概括其核心思想或情节：\n"
+                    f"{p_doc.page_content[:500]}"
+                )
+                
+                start_gen = time.time()
+                summary = self.eval_llm.invoke(summary_prompt).strip()
+                logger.info(f"✅ 第 {i+1} 个文档摘要生成完成，耗时：{time.time() - start_gen:.2f}秒")
+                
+                if "核心思想：" in summary: summary = summary.split("核心思想：")[1]
+                if "概括：" in summary: summary = summary.split("概括：")[1]
+            except Exception as e:
+                logger.error(f"❌ 生成摘要失败 (Index {i}): {e}")
+                # 关键决策：如果 LLM 失败，是重试还是跳过？
+                # 这里选择跳过并标记，避免死循环卡住整个进程
+                summary = "生成失败：无法连接模型或超时"
+                # 也可以选择 raise e 来停止程序，让用户手动修复后重试
             
-            if docs:
-                logger.info(f"嵌入批次：{current_index}-{end_index} ({len(docs)} 片段)")
-                self.vector_store.add_documents(docs)
-                self._save_checkpoint(end_index)
-            current_index = end_index
+            # 更新父文档元数据
+            p_doc.metadata.update({
+                "source": os.path.basename(self.txt_path),
+                "summary": summary,
+                "parent_id": f"parent_{i}",
+                "is_parent": True
+            })
             
-        if os.path.exists(self.checkpoint_path): os.remove(self.checkpoint_path)
-        logger.info("🎉 索引构建完成！")
+            current_chapter = self._get_current_chapter(p_doc.page_content, "未知章节")
+            p_doc.metadata["chapter"] = current_chapter
+
+            # 将父文档存入 Doc Store (Key-Value 存储)
+            # 这一步很快，本地文件 IO
+            try:
+                self.doc_store.mset([(f"parent_{i}", p_doc)])
+            except Exception as e:
+                logger.error(f"保存父文档到本地存储失败：{e}")
+
+            # --- 方案一：切分子文档 ---
+            child_docs = self.child_splitter.split_documents([p_doc])
+            
+            for c_doc in child_docs:
+                c_doc.metadata.update({
+                    "parent_id": f"parent_{i}",
+                    "summary": summary,
+                    "chapter": current_chapter,
+                    "source": os.path.basename(self.txt_path),
+                    "is_parent": False
+                })
+                docs_to_embed.append(c_doc)
+            
+            total_children += len(child_docs)
+            
+            # 4. 批量嵌入并保存 (每处理完一个父文档就写入，确保断点准确)
+            if docs_to_embed:
+                try:
+                    # 单个父文档的子文档数量不多，直接 add 即可
+                    self.vector_store.add_documents(docs_to_embed)
+                    docs_to_embed = [] # 清空缓存
+                except Exception as e:
+                    logger.error(f"嵌入向量失败：{e}")
+                    # 如果嵌入失败，不要保存 checkpoint，下次重启会重试这个文档
+                    continue
+
+            # 5. ✅ 保存断点 (关键：只有当 doc_store 和 vector_store 都成功后才更新)
+            self._save_checkpoint(i)
+            
+            # 进度日志
+            if (i + 1) % 10 == 0 or i == total_parents - 1:
+                logger.info(f"🎉 阶段性完成：已处理 {i+1}/{total_parents} 父文档，累计子文档 {self.vector_store._collection.count()} (含历史)。")
+
+        # 6. 清理 Checkpoint (全部完成后)
+        if os.path.exists(self.checkpoint_path):
+            os.remove(self.checkpoint_path)
+            logger.info("🧹 所有文档处理完毕，已清除 Checkpoint 文件。")
+        
+        self.parent_child_index_built = True
+        logger.info("🎉 父子文档索引与摘要元数据构建完成！")
 
     def _load_checkpoint(self) -> int:
+        """
+        读取断点信息。
+        返回: 最后一个已成功处理的 parent_index (下次应从 index + 1 开始)
+        """
         if os.path.exists(self.checkpoint_path):
             try:
                 with open(self.checkpoint_path, 'r', encoding='utf-8') as f:
-                    return json.load(f).get("processed_chars", 0)
-            except: return 0
-        return 0
+                    data = json.load(f)
+                    # 兼容旧格式
+                    if "last_processed_index" in data:
+                        return data["last_processed_index"]
+                    # 如果没有新字段，尝试估算（旧逻辑可能不准，建议直接返回 -1 重头来或手动清理）
+                    # 这里为了安全，如果格式不对，返回 -1 表示从头开始
+                    logger.warning("Checkpoint 格式过旧，将重新构建索引。")
+                    return -1
+            except Exception as e:
+                logger.error(f"读取 Checkpoint 失败：{e}，将重新构建。")
+                return -1
+        return -1
 
-    def _save_checkpoint(self, processed_chars: int):
+    def _save_checkpoint(self, index: int):
+        """
+        保存断点信息。
+        参数: index - 当前刚刚成功处理完的 parent_index
+        """
         try:
             with open(self.checkpoint_path, 'w', encoding='utf-8') as f:
-                json.dump({"processed_chars": processed_chars}, f)
-        except: pass
+                json.dump({"last_processed_index": index}, f, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"保存 Checkpoint 失败：{e}")
 
     def _get_current_chapter(self, text_segment: str, last_chapter: str) -> str:
-        matches = self.chapter_pattern.findall(text_segment)
-        return f"第{matches[-1]}章" if matches else last_chapter
+        """
+        增强版章节提取：
+        1. 使用更宽松的正则匹配多种格式（中文数字、阿拉伯数字、全角数字、Chapter X）。
+        2. 优先扫描文本前 600 字（标题通常在片段开头）。
+        3. 【关键】如果当前片段没找到，且 last_chapter 有效，则直接继承上一章。
+           这解决了 RecursiveCharacterTextSplitter 把标题切到上一个片段的问题。
+        """
+        if not text_segment:
+            return last_chapter
+
+        # 定义更强大的正则模式
+        # 匹配：第 1 章，第 一 章，第 1 节，Chapter 1, 一章
+        pattern = re.compile(
+            r'(?:第\s*([0-90-9一二三四五六七八九十百千]+)\s*[章节])|'  # 第 X 章/节
+            r'(?:Chapter\s*([0-9]+))|'                              # Chapter X
+            r'(?:([一二三四五六七八九十百千]+)\s*章)'                # X 章 (如 "一章")
+        )
+        
+        # 只扫描前 600 个字符，提高效率且避免匹配到正文中出现的"第 X 章"字样
+        search_text = text_segment[:600] 
+        matches = pattern.findall(search_text)
+        
+        if matches:
+            # findall 返回元组列表，例如 [('1', '', ''), ('', '2', '')]
+            # 我们需要取第一个非空的分组
+            first_match = matches[0]
+            chapter_num = ""
+            for group in first_match:
+                if group:
+                    chapter_num = group
+                    break
+            
+            if chapter_num:
+                return f"第{chapter_num}章"
+        
+        # 【核心修复】如果当前片段没找到章节号：
+        # 检查是否有上一个有效的章节信息。如果有，说明这是同一章的后续部分，直接继承。
+        if last_chapter and last_chapter != "未知章节":
+            return last_chapter
+            
+        return "未知章节"
 
     def _log_interaction(self, question: str, full_response: str, metrics: Dict[str, Any]):
         log_entry = {
@@ -462,13 +776,31 @@ class RAGEngine:
             score = similarities[i] if i < len(similarities) else 0.0
             r_score = d.metadata.get('rerank_score', 0)
             tag_label = "🔥[核心依据]" if r_score > 0.7 else "❄️[辅助参考]"
+        
+            # ✅ 新增：提取摘要
+            summary = d.metadata.get('summary', '无摘要')
+            chapter = d.metadata.get('chapter', '?')
             
+            tag_label = "🔥[核心依据]" if d.metadata.get('rerank_score', 0) > 0.7 else "❄️[辅助参考]"
+            
+            # 记录调试信息
             self.last_retrieval_debug_info.append({
-                "index": i + 1, "content": d.page_content, "score": round(score, 4),
-                "rerank_score": round(r_score, 4), "chapter": d.metadata.get("chapter", "?"), "is_cited": False
+                "index": i + 1, 
+                "content": d.page_content, 
+                "summary": summary, # 记录摘要
+                "score": round(score, 4),
+                "rerank_score": round(d.metadata.get('rerank_score', 0), 4), 
+                "chapter": chapter, 
+                "is_cited": False
             })
             
-            context_evidence.append(f"[依据 {i+1}] {tag_label} (章节:{d.metadata.get('chapter', '?')} | Rerank:{r_score:.2f}):\n{d.page_content}")
+            # ✅ 修改 Context 格式：加入摘要作为引导
+            context_segment = (
+                f"[依据 {i+1}] {tag_label} (章节:{chapter})\n"
+                f"> 📝 **核心摘要**: {summary}\n"
+                f"{d.page_content}"
+            )
+            context_evidence.append(context_segment)
         
         timer.checkpoint("Context_Building_Done") 
         return "\n\n---\n\n".join(context_evidence)
@@ -485,7 +817,10 @@ class RAGEngine:
    - 关键概念、金句必须 **加粗**。
    - 引用原文必须使用 > 引用块 格式，并在末尾标注章节，如：`—— [第X章]`。
    - 多点论述使用简洁的无序列表 (-)，每项尽量简短有力。
-3. **严谨举证**：所有观点必须源自上下文。若需引用特定片段，可在句末自然标注 `(见依据 X)`，但不要破坏句子流畅性。
+3. **严谨举证 (强制执行)**：
+   - **每一句**基于原文的观点、数据或情节描述，**必须**在句末明确标注来源索引，格式为 `(见依据 N)`，其中 N 是参考上下文中对应的编号 (1, 2, 3...)。
+   - **禁止**只写章节号而不写依据编号。章节号用于展示出处，`(见依据 N)` 用于定位具体片段，两者**缺一不可**。
+   - 示例：丁元英的核心认知源于对文化属性的洞察 `(见依据 1)`。他在古城的经历验证了这一理论 `(见依据 2)`。
 4. **极简主义**：能用一句话说清的，绝不用两段。拒绝车轱辘话。
 
 ## 参考上下文
@@ -494,7 +829,7 @@ class RAGEngine:
 ## 用户问题
 {question}
 
-## 你的回答 (立即开始，注意排版美观):
+## 你的回答 (立即开始，注意排版美观，切记标注依据编号):
 """
         prompt_text = prompt_template.format(context=context_text, question=question)
         
@@ -509,77 +844,138 @@ class RAGEngine:
     # ==========================================
     def _evaluate_retrieval_quality(self, question: str, docs: List[Document]) -> bool:
         """
-        ✅ 修复版：模仿快版本逻辑。
-        1. 优先看 Rerank 分数：高分直接过，低分直接弃。
-        2. 仅在分数模糊时调用小模型，且不再使用 jieba 关键词过滤。
-        3. 避免频繁的重试触发。
+        ✅ 优化版评估逻辑：
+        1. Top-K 宽容度：检查前 eval_top_k 个文档中是否有至少一个相关。
+        2. 启发式分数过滤：
+           - 计算前 K 个文档的平均 Rerank 分数。
+           - 高分 (>0.75) -> 直接通过 (True)。
+           - 低分 (<0.45) -> 直接失败 (False)。
+           - 中间分 -> 调用 LLM 对前 K 个进行批量评估。
         """
         if not docs:
             return False
         
-        top_doc = docs[0]
-        top_score = top_doc.metadata.get('rerank_score', 0)
+        # 获取配置参数
+        eval_k = self.default_params.get("eval_top_k", 3)
+        # 确保不超过实际文档数
+        k_to_eval = min(len(docs), eval_k)
+        docs_to_check = docs[:k_to_eval]
+        
+        # 提取 Rerank 分数
+        scores = [d.metadata.get('rerank_score', 0) for d in docs_to_check]
+        
+        if not scores:
+            return False
+            
+        avg_score = sum(scores) / len(scores)
+        max_score = max(scores)
+        
+        logger.info(f"📊 [评估] 前 {k_to_eval} 个文档 - 平均分：{avg_score:.2f}, 最高分：{max_score:.2f}")
 
-        # 1. 高分直接通过 (> 0.85) - 毫秒级完成
-        if top_score > 0.85:
-            logger.info(f"✅ [快模式] Rerank 高分 ({top_score:.2f}) 直接通过评估。")
+        # --- 策略 1: 基于聚合分数的快速通道 (Heuristic Fast Path) ---
+        
+        # 情况 A: 平均分很高，说明整体质量极好，直接通过
+        if avg_score > 0.75:
+            logger.info(f"✅ [快模式] 平均分 ({avg_score:.2f}) > 0.75，直接判定检索成功。")
             return True
         
-        # 2. 低分直接失败 (< 0.5) - 毫秒级完成
-        if top_score < 0.5:
-            logger.warning(f"⚠️ [快模式] Rerank 低分 ({top_score:.2f}) 直接判定失败。")
+        # 情况 B: 最高分都很低，说明最好的也不咋地，直接失败
+        # 注意：这里用 max_score 比 avg_score 更严格，防止漏掉唯一的相关项，但也防止全是噪音
+        if max_score < 0.45:
+            logger.warning(f"⚠️ [快模式] 最高分 ({max_score:.2f}) < 0.45，直接判定检索失败。")
             return False
         
-        # 3. 中等分数 (0.5 - 0.85) - 才调用小模型辅助评估
-        logger.info(f"🤔 [快模式] Rerank 分数 ({top_score:.2f}) 中等，启动小模型辅助评估...")
+        # --- 策略 2: 中间地带，调用 LLM 进行 Top-K 批量评估 ---
+        logger.info(f"🤔 [慢模式] 分数处于中间地带 ({avg_score:.2f})，启动 LLM 辅助评估前 {k_to_eval} 个文档...")
+        
+        # 构造 Prompt：一次性让 LLM 判断这 K 个文档里有没有相关的
+        # 这样比循环调用 K 次 LLM 要快得多，且能利用 LLM 的比较能力
+        docs_context = ""
+        for i, doc in enumerate(docs_to_check):
+            docs_context += f"[文档 {i+1}]: {doc.page_content[:200]}...\n"
         
         prompt = (
-            f"你是一个严格的评估助手。请判断给定的【文档片段】是否包含与【用户问题】相关的**实质性内容**。\n"
-            f"用户问题：{question}\n"
-            f"文档片段 (Top 1): {top_doc.page_content[:300]}...\n"
-            f"如果片段与问题相关（哪怕只是部分相关），输出 'YES'。\n"
-            f"如果片段完全无关，输出 'NO'。\n"
-            f"只输出 YES 或 NO。"
+            f"你是一个严格的检索评估专家。\n"
+            f"用户问题：{question}\n\n"
+            f"系统检索到了以下 {k_to_eval} 个候选片段：\n{docs_context}\n\n"
+            f"任务：判断上述片段中，**是否存在至少一个**片段包含回答用户问题所需的**实质性信息**？\n"
+            f"注意：不需要所有片段都相关，只要有一个有用即可。\n\n"
+            f"如果存在相关片段，输出 'YES'。\n"
+            f"如果所有片段都无关或全是噪音，输出 'NO'。\n"
+            f"只输出 YES 或 NO，不要解释。"
         )
         
         try:
             resp = self.eval_llm.invoke(prompt).strip().upper()
             
-            if 'NO' in resp:
-                logger.warning("⚠️ 评估模型判定不相关，触发重试。")
-                return False
-            else:
-                logger.info("✅ 评估模型判定相关。")
+            if 'YES' in resp:
+                logger.info("✅ LLM 判定：前 K 个文档中存在相关内容，评估通过。")
                 return True
+            else:
+                logger.warning("⚠️ LLM 判定：前 K 个文档均不相关，评估失败，触发重试。")
+                return False
                 
         except Exception as e:
-            logger.error(f"评估模型调用失败：{e}，保守起见返回 True。")
+            logger.error(f"❌ LLM 评估调用失败：{e}，保守起见返回 True (不阻断流程)。")
             return True
 
     def _post_process_response(self, full_response, context_text, question, timer):
-        """后处理：统计引用"""
+        """后处理：统计引用 (增强版：支持章节号模糊匹配)"""
+        
         def count_citations(text: str):
             indices = set()
-            pattern = r'[\[\(【](?:依据 | 参考)?\s*:?\s*(\d+)[\]\)】]'
-            matches = re.findall(pattern, text)
-            for m in matches:
+            
+            # 1. 优先匹配严格的依据编号：(见依据 1), [依据 2], (1) 等
+            pattern_strict = r'[\[\(【](?:依据 | 参考 | 见依据 | 见参考)?\s*:?\s*(\d+)[\]\)】]'
+            matches_strict = re.findall(pattern_strict, text)
+            
+            for m in matches_strict:
                 try: 
                     idx = int(m)
+                    # 确保索引在有效范围内
                     if 1 <= idx <= len(self.last_retrieval_debug_info):
                         indices.add(idx)
-                except ValueError: pass
+                except ValueError: 
+                    pass
+            
+            # 2. 【兜底策略】如果严格匹配数量为 0，尝试匹配章节号进行模糊关联
+            # 场景：LLM 只写了 "—— [第四章]"，没写 "(见依据 1)"
+            if len(indices) == 0 and len(self.last_retrieval_debug_info) > 0:
+                logger.info("⚠️ 未检测到严格依据编号，尝试通过章节号进行模糊匹配...")
+                
+                # 匹配 "—— [第 X 章]" 或 "—— [第四章]"
+                chapter_pattern = r'——\s*\[第\s*([0-90-9一二三四五六七八九十百]+)\s*章\]'
+                chapter_matches = re.findall(chapter_pattern, text)
+                
+                if chapter_matches:
+                    # 遍历所有检索到的依据，看章节是否匹配
+                    for item in self.last_retrieval_debug_info:
+                        item_chapter = item.get('chapter', '') # 例如："第 4 章"
+                        
+                        for q_chapter_num in chapter_matches:
+                            # 简单归一化：如果检索结果的章节包含用户输出的章节数字/文字
+                            # 注意：这里是一个简化逻辑，完美方案需要中文数字转阿拉伯数字
+                            if str(q_chapter_num) in item_chapter or item_chapter in f"第{q_chapter_num}章":
+                                indices.add(item["index"])
+                                logger.debug(f"模糊匹配成功：依据 {item['index']} ({item_chapter}) <-> 文中提到 [第{q_chapter_num}章]")
+            
             return indices, len(indices)
 
         cited_indices, cited_count = count_citations(full_response)
+        
+        # 如果连模糊匹配都没找到，才判定为缺少引用
         needs_retry = (cited_count == 0 and len(self.last_retrieval_debug_info) > 0)
         
         if needs_retry:
-            logger.warning("⚠️ [自检警告] 生成结果缺少引用。为避免延迟，跳过 LLM 重写步骤，仅添加系统注记。")
-            full_response += "\n\n> ⚠️ **系统注**: 本次回答未能自动标注原文引用，请人工核对上下文。"
+            logger.warning("⚠️ [自检警告] 生成结果完全缺少引用标识 (含章节号)。添加系统注记。")
+            full_response += "\n\n> ⚠️ **系统注**: 本次回答未能自动标注原文引用或章节出处，请人工核对上下文。"
         
+        # 更新 debug_info 中的 is_cited 状态，供前端显示
         for item in self.last_retrieval_debug_info:
             if item["index"] in cited_indices:
                 item["is_cited"] = True
+            else:
+                item["is_cited"] = False # 显式设为 False
         
         return full_response, cited_count, cited_indices, needs_retry
 

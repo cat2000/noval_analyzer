@@ -20,6 +20,16 @@ PARAM_CONFIG = {
     "top_k_initial": {"label": "初召 TopK", "type": "slider", "min": 5, "max": 50, "step": 5, "default": 8, "desc_short": "混合召回数量 (BM25+向量)", "home_node_id": "retrieval"},
     "rerank_threshold": {"label": "重排门槛", "type": "slider", "min": 0.0, "max": 0.9, "step": 0.05, "default": 0.5, "desc_short": "低于此分数的片段将被丢弃", "home_node_id": "rerank"},
     "max_self_rag_attempts": {"label": "最大重试", "type": "slider", "min": 0, "max": 3, "step": 1, "default": 1, "desc_short": "检索质量不佳时自动重试", "home_node_id": "eval"},
+    "eval_top_k": {
+        "label": "评估宽容度", 
+        "type": "slider", 
+        "min": 1, 
+        "max": 5, 
+        "step": 1, 
+        "default": 3, 
+        "desc_short": "数值越大，越容易通过评估 (减少重试)", 
+        "home_node_id": "eval"
+    },
     "top_k_final": {"label": "终选 TopK", "type": "slider", "min": 1, "max": 10, "step": 1, "default": 3, "desc_short": "最终送入上下文的最大片段数", "home_node_id": "generation"}
 }
 
@@ -28,7 +38,7 @@ PIPELINE_NODES = [
     {"id": "multi_query", "title": "多路发散", "icon": "🔀", "controlled_by": ["multi_query_count", "rewrite_mode"], "desc": "多角度变体", "stage_key": "MultiQuery_Gen"},
     {"id": "retrieval", "title": "混合检索", "icon": "📚", "controlled_by": ["top_k_initial"], "desc": "向量 + 关键词", "stage_key": "Parallel_Retrieval"},
     {"id": "rerank", "title": "重排序", "icon": "⚖️", "controlled_by": ["top_k_initial", "rerank_threshold", "top_k_final"], "desc": "精细打分", "stage_key": "Rerank"},
-    {"id": "eval", "title": "质量评估", "icon": "🛡️", "controlled_by": ["rerank_threshold", "max_self_rag_attempts"], "desc": "相关性判断 (含重试)", "stage_key": "Eval_Phase"}, 
+    {"id": "eval", "title": "质量评估", "icon": "🛡️", "controlled_by": ["rerank_threshold", "max_self_rag_attempts", "eval_top_k"], "desc": "相关性判断 (含重试)", "stage_key": "Eval_Phase"}, 
     {"id": "generation", "title": "文章生成", "icon": "✍️", "controlled_by": ["top_k_final"], "desc": "LLM 撰写", "stage_key": "LLM_Generation"}
 ]
 
@@ -117,6 +127,25 @@ def get_custom_css():
         ::-webkit-scrollbar-thumb { background: #d7ccc8; border-radius: 3px; }
         ::-webkit-scrollbar-thumb:hover { background: #bcaaa4; }
 
+        /* 证据卡片内的摘要样式 */
+        .evidence-card > div:nth-child(2) { 
+            /* 针对刚才插入的 summary_html 容器进行微调 */
+            margin-bottom: 6px !important; 
+            line-height: 1.3 !important;
+        }
+        /* 确保长摘要不会破坏布局 */
+        .evidence-text { 
+            font-size: 0.85rem; 
+            color: #37474f; 
+            line-height: 1.6; 
+            font-family: 'Songti SC', serif; 
+            display: -webkit-box; 
+            -webkit-line-clamp: 3; 
+            -webkit-box-orient: vertical; 
+            overflow: hidden; 
+            margin-top: 4px; /* 增加一点上间距，与摘要分开 */
+        }
+        
         /* 其他原有样式保持不变... */
         .panel-title { font-size: 1.1rem; font-weight: bold; color: #5d4037; margin-bottom: 15px; border-left: 4px solid #8d6e63; padding-left: 10px; display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
         .tech-item { margin-bottom: 8px; padding: 6px; background: #f9f9f9; border-radius: 8px; border: 1px solid #eee; }
@@ -599,7 +628,7 @@ def render_main_interface():
         with st.expander("参数映射指南", expanded=False, key="guide_expander"):
             st.markdown("了解每个参数如何影响检索与生成的全过程。")
             
-            # 关键点：
+                # 关键点：
             # 1. 使用 textwrap.dedent 去除 Python 缩进带来的空格
             # 2. 三引号紧接 f"""，后面紧跟 <div，中间不要有空行
             # 3. 移除了所有 <!-- --> 注释，防止解析歧义
@@ -638,6 +667,11 @@ def render_main_interface():
                     </div>
                     <div style="border-top:1px dashed #cfd8dc; margin:10px 0;"></div>
                     <div style="margin-bottom:10px; padding:8px; background:#fff; border-radius:6px; border-left:3px solid #8d6e63;">
+                        <div style="font-weight:bold; font-size:0.9rem; color:#3e2723;">{PARAM_CONFIG["eval_top_k"]["label"]}</div>
+                        <div style="font-size:0.8rem; color:#546e7a; margin:2px 0;">{PARAM_CONFIG["eval_top_k"].get('desc_short', '')}</div>
+                        <code style="background:#efebe9; color:#d84315; padding:2px 6px; border-radius:4px; font-size:0.75rem;">eval_top_k</code>
+                    </div>
+                    <div style="margin-bottom:10px; padding:8px; background:#fff; border-radius:6px; border-left:3px solid #8d6e63;">
                         <div style="font-weight:bold; font-size:0.9rem; color:#3e2723;">{PARAM_CONFIG["max_self_rag_attempts"]["label"]}</div>
                         <div style="font-size:0.8rem; color:#546e7a; margin:2px 0;">自动重试次数 (智能降级)</div>
                         <code style="background:#efebe9; color:#d84315; padding:2px 6px; border-radius:4px; font-size:0.75rem;">max_self_rag_attempts</code>
@@ -646,6 +680,7 @@ def render_main_interface():
             </div>""")
             
             st.markdown(guide_html, unsafe_allow_html=True)
+            
 
     # --- 右侧：证据溯源 ---
     with col_right:
@@ -661,12 +696,22 @@ def render_main_interface():
                 badge = "<span class='badge-cited'>✓ 引用</span>" if item.get("is_cited") else "<span class='badge-uncited'>参考</span>"
                 chapter = item.get('chapter', '未知')
                 content = item.get('content', '')
+                # ✅ 新增：获取摘要
+                summary = item.get('summary', '')
+                
+                # ✅ 新增：如果有摘要，构造带摘要的 HTML
+                # ✅ 修复：将定义好的 summary_html 实际插入到模板中
+                summary_html = f'<div style="font-size:0.75rem; color:#d84315; font-weight:bold; margin-bottom:4px;">📝 {summary}</div>' if summary else ''
+                
                 st.markdown(f"""
                 <div class="{css_class}">
                     <div class="evidence-meta"><span>📖 {chapter}</span>{badge}</div>
+                    {summary_html}  <!-- ✅ 这里插入了摘要 -->
                     <div class="evidence-text">{content}</div>
                 </div>
                 """, unsafe_allow_html=True)
+                
+
             st.markdown("</div>", unsafe_allow_html=True)
             if len(debug_data) > 8:
                 st.caption(f"💡 还有 {len(debug_data)-8} 个片段在后台参与计算。")
