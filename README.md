@@ -45,7 +45,7 @@
 
 ### 1. 环境准备
 
-确保您的系统已安装 **Python 3.9+** 和 **Ollama**。
+确保您的系统已安装 **Python 3.11** 和 **Ollama**。
 
 #### 安装 Ollama 并拉取模型
 ```bash
@@ -55,8 +55,20 @@ ollama pull qwen3
 ollama pull qwen3:0.6b  # 用于快速评估的小模型
 ```
 
-### 2. 启动应用
-运行文件： 启动专家系统.command
+### 2. 创建python虚拟环境
+
+```bash
+# 创建python虚拟环境
+/opt/homebrew/bin/python3.11 -m venv .venv
+```
+
+### 3. 修改启动文件
+
+```bash
+# 授权启动文件可双击执行。
+chmod +x 启动专家系统.command
+```
+双击运行文件： 启动专家系统.command
 *首次启动时，系统会自动构建向量索引，可能需要几分钟时间，请耐心等待进度条完成。*
 
 ---
