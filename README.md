@@ -55,19 +55,8 @@ ollama pull qwen3
 ollama pull qwen3:0.6b  # 用于快速评估的小模型
 ```
 
-#### 安装 Python 依赖
-```bash
-pip install -r requirements.txt
-```
-*(注：请确保 `requirements.txt` 包含 `langchain`, `chromadb`, `sentence-transformers`, `streamlit`, `scikit-learn`, `numpy` 等库)*
-
-### 2. 准备数据
-将小说文本文件命名为 `遥远的救世主.txt` 并放置在项目根目录下。
-
-### 3. 启动应用
-```bash
-streamlit run app.py
-```
+### 2. 启动应用
+运行文件： 启动专家系统.command
 *首次启动时，系统会自动构建向量索引，可能需要几分钟时间，请耐心等待进度条完成。*
 
 ---
@@ -97,7 +86,6 @@ noval_analyzer/
 ├── chroma_db/              # 向量数据库持久化目录 (自动生成)
 ├── logs/                   # 会话日志与性能指标 (自动生成)
 ├── checkpoint.json         # 索引构建断点记录 (自动生成)
-├── requirements.txt        # Python 依赖列表
 └── README.md               # 项目说明文档
 ```
 
