@@ -57,3 +57,9 @@ checkpoint.json
 
 # 敏感信息 (如果有 .env 文件存 API KEY)
 .env
+
+# 忽略所有 .log 结尾的文件
+*.log
+
+# 如果 log 在 logs 文件夹下，也可以忽略整个文件夹
+logs/
