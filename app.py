@@ -30,7 +30,16 @@ PARAM_CONFIG = {
         "desc_short": "数值越大，越容易通过评估 (减少重试)", 
         "home_node_id": "eval"
     },
-    "top_k_final": {"label": "终选 TopK", "type": "slider", "min": 1, "max": 10, "step": 1, "default": 3, "desc_short": "最终送入上下文的最大片段数", "home_node_id": "generation"}
+    "top_k_final": {
+        "label": "终选 TopK (基准)", 
+        "type": "slider", 
+        "min": 1, 
+        "max": 10, 
+        "step": 1, 
+        "default": 3, 
+        "desc_short": "送入上下文的基准片段数 (系统会根据问题复杂度智能微调 ±2)", 
+        "home_node_id": "generation"
+    },
 }
 
 PIPELINE_NODES = [
@@ -52,7 +61,7 @@ TECH_STACK = [
 ]
 
 # ==========================================
-# 2. 样式定义 (Styles) - ✅ 已移除所有强制固定高度的 CSS
+# 2. 样式定义 (Styles) - ✅ 重点优化：侧边栏淡化，中间突出
 # ==========================================
 def get_custom_css():
     return """
@@ -61,8 +70,6 @@ def get_custom_css():
         .stApp { 
             background-color: #fcfbf9; 
             background-image: linear-gradient(to bottom, #fcfbf9 0%, #f7f5f0 100%); 
-            /* ✅ 删除了 overflow: hidden, height: 100vh, display: flex 等强制固定样式 */
-            /* 让页面自然滚动 */
         }
         body { 
             font-family: 'Songti SC', 'STSong', 'Noto Serif SC', 'SimSun', serif; 
@@ -71,129 +78,200 @@ def get_custom_css():
             padding: 0;
         }
         
-        /* 主容器：恢复默认行为，允许自然高度 */
+        /* 主容器 */
         .block-container { 
             padding-top: 1rem !important; 
             padding-bottom: 2rem !important; 
-            max-width: 2000px !important; /* 限制最大宽度，避免太宽 */
-            /* ✅ 删除了 height, display: flex, overflow: hidden 等 */
+            max-width: 2000px !important;
         }
 
-        /* 面板通用样式：保留美观，但移除高度限制 */
+        /* --- 🎨 核心修改：侧边栏面板淡化处理 --- */
         .sidebar-panel { 
-            background: #fff; 
-            border-radius: 12px; 
-            border: 1px solid #efebe9; 
-            box-shadow: 0 4px 12px rgba(0,0,0,0.05); 
-            padding: 15px; 
-            /* ✅ 删除了 height: 100%, overflow-y: auto */
-            /* 让面板内容自然撑开高度 */
-            margin-bottom: 20px; /* 增加底部间距 */
+            /* 背景改为极淡的暖灰，不再是纯白 */
+            background: #faf9f6; 
+            /* 边框极淡，几乎隐形 */
+            border: 1px solid #f0ebe5; 
+            /* 阴影完全移除或极弱，减少立体感，让它退后 */
+            box-shadow: none; 
+            padding: 20px 15px; 
+            margin-bottom: 20px;
+            /* 字体颜色整体调淡 */
+            color: #6d6d6d; 
+            transition: all 0.3s ease;
         }
         
-        /* 聊天区域样式优化 */
+        /* 鼠标悬停时才稍微明显一点点，平时保持低调 */
+        .sidebar-panel:hover {
+            border-color: #e6dfd5;
+            background: #fffdfb;
+        }
+
+        /* 侧边栏标题淡化 */
+        .sidebar-panel .panel-title { 
+            font-size: 1.0rem; 
+            font-weight: 600; 
+            /* 标题颜色改为深灰褐，不再用深黑 */
+            color: #8d7b68; 
+            margin-bottom: 15px; 
+            /* 左边框颜色也变淡 */
+            border-left: 3px solid #d7ccc8; 
+            padding-left: 10px; 
+            display: flex; 
+            align-items: center; 
+            gap: 8px; 
+            flex-shrink: 0; 
+            letter-spacing: 0.5px;
+        }
+
+        /* 技术栈列表项淡化 */
+        .tech-item { 
+            margin-bottom: 10px; 
+            padding: 8px; 
+            /* 移除背景块，或者用极淡的颜色 */
+            background: transparent; 
+            border-radius: 6px; 
+            border: none; 
+        }
+        .tech-label { 
+            font-size: 0.7rem; 
+            /* 标签颜色变淡蓝灰 */
+            color: #9ca3af; 
+            text-transform: uppercase; 
+            letter-spacing: 1px; 
+            margin-bottom: 4px; 
+            font-weight: 600;
+        }
+        .tech-value { 
+            font-size: 0.9rem; 
+            /* 关键值颜色改为深灰，不加粗太狠 */
+            color: #555555; 
+            font-weight: 500; 
+            font-family: 'Consolas', monospace; 
+        }
+        .tech-desc { 
+            font-size: 0.75rem; 
+            /* 描述文字更淡 */
+            color: #888888; 
+            margin-top: 4px; 
+            line-height: 1.5; 
+        }
+        
+        /* Badge 莫兰迪色系淡化 */
+        .badge-tech { 
+            display: inline-block; 
+            /* 背景改为淡灰蓝 */
+            background: #eceff1; 
+            /* 文字改为灰蓝 */
+            color: #78909c; 
+            padding: 2px 6px; 
+            border-radius: 4px; 
+            font-size: 0.65rem; 
+            font-weight: 600; 
+            margin-right: 5px; 
+            border: 1px solid #cfd8dc;
+        }
+
+        /* --- 中间聊天区域保持高对比度 (突出) --- */
         .chat-section { 
-            background: #fff; 
+            background: #ffffff; /* 纯白背景，突出内容 */
             border-radius: 12px; 
-            border: 1px solid #e0e0e0; 
-            box-shadow: 0 4px 12px rgba(0,0,0,0.03); 
+            /* 保留轻微阴影，制造浮起感 */
+            box-shadow: 0 4px 20px rgba(0,0,0,0.04); 
+            border: 1px solid #f0f0f0;
             padding: 10px 0;
             margin-bottom: 15px;
         }
         
-        /* 聊天记录滚动区：不再强制固定高度，让它随内容增长 */
         .chat-history { 
-            /* ✅ 删除了 flex: 1, min-height: 0, overflow-y: auto */
-            /* 让消息列表自然向下延伸 */
             padding: 10px 15px; 
         }
         
-        /* 底部控制台：不再限制最大高度，允许展开 */
         .bottom-console { 
-            background: #fff; 
+            background: #ffffff; 
             border-radius: 12px; 
-            border: 1px solid #e0e0e0; 
+            border: 1px solid #f0f0f0; 
             padding: 10px 15px; 
-            box-shadow: 0 4px 12px rgba(0,0,0,0.03); 
-            /* ✅ 删除了 max-height, overflow-y: auto */
+            box-shadow: 0 4px 20px rgba(0,0,0,0.04); 
             display: flex; 
             flex-direction: column; 
             gap: 5px; 
         }
 
-        /* 滚动条美化 (Webkit) */
-        ::-webkit-scrollbar { width: 6px; height: 6px; }
-        ::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 3px; }
-        ::-webkit-scrollbar-thumb { background: #d7ccc8; border-radius: 3px; }
-        ::-webkit-scrollbar-thumb:hover { background: #bcaaa4; }
+        /* 滚动条美化 (更细更淡) */
+        ::-webkit-scrollbar { width: 4px; height: 4px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #e0e0e0; border-radius: 2px; }
+        ::-webkit-scrollbar-thumb:hover { background: #d0d0d0; }
 
-        /* 证据卡片内的摘要样式 */
-        .evidence-card > div:nth-child(2) { 
-            /* 针对刚才插入的 summary_html 容器进行微调 */
-            margin-bottom: 6px !important; 
-            line-height: 1.3 !important;
+        /* 证据卡片内的摘要样式 (右侧也需淡化) */
+        .evidence-card { 
+            padding: 10px; 
+            border-radius: 6px; 
+            /* 背景极淡 */
+            background: #fafafa; 
+            border: 1px solid #f0f0f0; 
+            transition: all 0.3s; 
+            margin-bottom: 8px;
         }
-        /* 确保长摘要不会破坏布局 */
+        .evidence-card.cited { 
+            /* 引用过的稍微明显一点，但依然保持柔和 */
+            background: #fffdf5; 
+            border-color: #ffe0b2; 
+            box-shadow: none; 
+        }
+        .evidence-card:not(.cited) { 
+            opacity: 0.8; 
+            filter: grayscale(0.1); 
+        }
+        .evidence-meta { 
+            font-size: 0.7rem; 
+            color: #999999; 
+            margin-bottom: 4px; 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+        }
         .evidence-text { 
-            font-size: 0.85rem; 
-            color: #37474f; 
+            font-size: 0.8rem; 
+            color: #666666; 
             line-height: 1.6; 
             font-family: 'Songti SC', serif; 
             display: -webkit-box; 
             -webkit-line-clamp: 3; 
             -webkit-box-orient: vertical; 
             overflow: hidden; 
-            margin-top: 4px; /* 增加一点上间距，与摘要分开 */
+            margin-top: 4px; 
         }
+        /* 证据 Badge 淡化 */
+        .badge-cited { background: #ffe0b2; color: #a16207; padding: 1px 4px; border-radius: 3px; font-size: 0.6rem; font-weight: 600; border: 1px solid #ffcc80; }
+        .badge-uncited { background: #eceff1; color: #78909c; padding: 1px 4px; border-radius: 3px; font-size: 0.6rem; font-weight: 600; border: 1px solid #cfd8dc; }
         
-        /* 其他原有样式保持不变... */
-        .panel-title { font-size: 1.1rem; font-weight: bold; color: #5d4037; margin-bottom: 15px; border-left: 4px solid #8d6e63; padding-left: 10px; display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-        .tech-item { margin-bottom: 8px; padding: 6px; background: #f9f9f9; border-radius: 8px; border: 1px solid #eee; }
-        .tech-label { font-size: 0.75rem; color: #90a4ae; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
-        .tech-value { font-size: 0.95rem; color: #2c3e50; font-weight: bold; font-family: 'Consolas', monospace; }
-        .tech-desc { font-size: 0.8rem; color: #546e7a; margin-top: 4px; line-height: 1.4; }
-        .badge-tech { display: inline-block; background: #e3f2fd; color: #1976d2; padding: 2px 6px; border-radius: 4px; font-size: 0.7rem; font-weight: bold; margin-right: 5px; }
-        
-        /* 证据列表样式 */
-        .evidence-list { display: flex; flex-direction: column; gap: 12px; }
-        .evidence-card { padding: 12px; border-radius: 8px; background: #fafafa; border: 1px solid #eee; transition: all 0.3s; }
-        .evidence-card.cited { background: #fff8e1; border-color: #ffcc80; box-shadow: 0 2px 6px rgba(255, 179, 0, 0.1); transform: translateX(2px); }
-        .evidence-card:not(.cited) { opacity: 0.75; filter: grayscale(0.2); }
-        .evidence-meta { font-size: 0.75rem; color: #8d6e63; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; }
-        .evidence-text { font-size: 0.85rem; color: #37474f; line-height: 1.6; font-family: 'Songti SC', serif; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-        .badge-cited { background: #ffb74d; color: #fff; padding: 1px 5px; border-radius: 3px; font-size: 0.65rem; font-weight: bold; }
-        .badge-uncited { background: #cfd8dc; color: #fff; padding: 1px 5px; border-radius: 3px; font-size: 0.65rem; }
-        .empty-state { text-align: center; color: #90a4ae; font-style: italic; padding: 40px 10px; font-size: 0.9rem; display: flex; flex-direction: column; justify-content: center; }
+        .empty-state { text-align: center; color: #bdbdbd; font-style: italic; padding: 40px 10px; font-size: 0.9rem; display: flex; flex-direction: column; justify-content: center; }
         
         /* 头部样式 */
         .main-header { text-align: center; padding: 20px 0 30px 0; flex-shrink: 0; }
         .main-header h1 { font-family: 'Songti SC', serif; font-weight: bold; color: #2c3e50; letter-spacing: 2px; margin-bottom: 5px !important; text-shadow: 1px 1px 2px rgba(0,0,0,0.1); font-size: 2rem; }
         .subtitle { color: #78909c; font-size: 1.1rem; font-style: italic; }
         
-        /* 聊天输入区 */
-        .chat-input-area { padding: 10px 15px; border-top: 1px solid #eee; background: #fcfbf9; z-index: 100; }
-        .stChatMessage { padding: 8px 0; border-bottom: 1px solid #f5f5f5; }
+        .chat-input-area { padding: 10px 15px; border-top: 1px solid #f5f5f5; background: #fcfbf9; z-index: 100; }
+        .stChatMessage { padding: 8px 0; border-bottom: 1px solid #f9f9f9; }
         .stChatMessage:last-child { border-bottom: none; }
         
-        /* 监控面板样式 */
-        .pipeline-container { display: flex; flex-wrap: nowrap; gap: 8px; justify-content: stretch; margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid #eee; width: 100%; }
-        .stColumn {
-            display: flex !important;
-            flex-direction: column !important;
-            min-width: 0 !important;
-        }        
-        .node-card { width: 100%; padding: 8px 4px; background: #ffffff; border: 1px solid #e0e0e0; border-radius: 8px; text-align: center; box-shadow: 0 2px 6px rgba(0,0,0,0.04); transition: all 0.3s; border-top: 3px solid transparent; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; justify-content: center; }
-        .node-card.bottleneck { border-color: #d84315; border-top: 3px solid #d84315; background-color: #fffaf9; box-shadow: 0 6px 15px rgba(216, 67, 21, 0.15); animation: gentle-pulse 3s infinite; }
+        /* 监控面板样式 (保持原有逻辑，颜色微调以适配) */
+        .pipeline-container { display: flex; flex-wrap: nowrap; gap: 8px; justify-content: stretch; margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid #f0f0f0; width: 100%; }
+        .stColumn { display: flex !important; flex-direction: column !important; min-width: 0 !important; }        
+        .node-card { width: 100%; padding: 8px 4px; background: #ffffff; border: 1px solid #eeeeee; border-radius: 8px; text-align: center; box-shadow: 0 2px 6px rgba(0,0,0,0.02); transition: all 0.3s; border-top: 3px solid transparent; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+        .node-card.bottleneck { border-color: #ef9a9a; border-top: 3px solid #ef9a9a; background-color: #fff5f5; box-shadow: 0 6px 15px rgba(239, 154, 154, 0.15); animation: gentle-pulse 3s infinite; }
         @keyframes gentle-pulse { 0% { transform: translateY(0); } 50% { transform: translateY(-2px); } 100% { transform: translateY(0); } }
         .node-icon { font-size: 1.3rem; margin-bottom: 2px; line-height: 1; }
-        .node-title { font-weight: bold; color: #2c3e50; font-size: 0.75rem; margin-bottom: 2px; line-height: 1.2; }
-        .node-time { font-size: 0.55rem; color: #90a4ae; font-family: 'Consolas', monospace; background: #f5f7fa; padding: 1px 3px; border-radius: 4px; line-height: 1; }
-        .node-time.slow { color: #d84315; background: #ffebee; font-weight: bold; }
-        .optimization-tip { margin-top: 2px; font-size: 0.55rem; color: #d84315; background: #fff3e0; padding: 1px 3px; border-radius: 3px; width: 100%; box-sizing: border-box; text-align: center; border: 1px dashed #ffccbc; line-height: 1.2; }
+        .node-title { font-weight: 600; color: #546e7a; font-size: 0.75rem; margin-bottom: 2px; line-height: 1.2; }
+        .node-time { font-size: 0.55rem; color: #b0bec5; font-family: 'Consolas', monospace; background: #f5f7fa; padding: 1px 3px; border-radius: 4px; line-height: 1; }
+        .node-time.slow { color: #ef9a9a; background: #ffebee; font-weight: bold; }
+        .optimization-tip { margin-top: 2px; font-size: 0.55rem; color: #ef9a9a; background: #fff5f5; padding: 1px 3px; border-radius: 3px; width: 100%; box-sizing: border-box; text-align: center; border: 1px dashed #ffcdd2; line-height: 1.2; }
         .param-control-area { margin-top: 2px; margin-bottom: 2px; width: 100%; display: flex; flex-direction: column; align-items: center; }
-        .param-label-mini { font-size: 0.6rem; color: #546e7a; font-weight: bold; margin-bottom: 1px; display: block; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; width: 100%; }
-        .param-label-mini.urgent { color: #d84315; background: #fff3e0; padding: 1px 3px; border-radius: 2px; }
-        .param-ref-tag { margin-top: 4px; font-size: 0.72rem; color: #78909c; background: #f5f7fa; padding: 2px 4px; border-radius: 4px; width: 100%; box-sizing: border-box; text-align: center; border: 1px dotted #cfd8dc; font-style: italic; line-height: 1.2; }
+        .param-label-mini { font-size: 0.6rem; color: #78909c; font-weight: 600; margin-bottom: 1px; display: block; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; width: 100%; }
+        .param-label-mini.urgent { color: #ef9a9a; background: #fff5f5; padding: 1px 3px; border-radius: 2px; }
+        .param-ref-tag { margin-top: 4px; font-size: 0.72rem; color: #b0bec5; background: #f5f7fa; padding: 2px 4px; border-radius: 4px; width: 100%; box-sizing: border-box; text-align: center; border: 1px dotted #cfd8dc; font-style: italic; line-height: 1.2; }
         
         /* 隐藏 Streamlit 默认元素 */
         .stSlider label, .stSelectbox label, .stNumberInput label { display: none !important; }
@@ -206,7 +284,6 @@ def get_custom_css():
         .stSlider div[data-baseweb="slider"] { margin-top: 2px !important; margin-bottom: 2px !important; }
         footer, header { visibility: hidden; height: 0; }
         
-        /* 加载动画相关 */
         .loading-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 60vh; color: #78909c; font-style: italic; }
         .spinner { border: 3px solid #f3f3f3; border-top: 3px solid #8d6e63; border-radius: 50%; width: 24px; height: 24px; animation: spin 1s linear infinite; margin-bottom: 10px; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
@@ -455,12 +532,11 @@ def render_main_interface():
     debug_data = getattr(engine, 'last_retrieval_debug_info', [])
     bottleneck = max(stages, key=stages.get) if stages else None
 
-    # ✅ 关键修改：使用标准的 st.columns，不再包裹任何强制高度的 div
+    # 使用标准的 st.columns
     col_left, col_center, col_right = st.columns([1.2, 3.8, 1.2])
 
-    # --- 左侧：技术栈 ---
+    # --- 左侧：技术栈 (已淡化) ---
     with col_left:
-        # 不再需要 class='sidebar-panel' 来限制高度，但保留样式类用于美观
         st.markdown("<div class='sidebar-panel'>", unsafe_allow_html=True)
         st.markdown("<div class='panel-title'>⚙️ 技术架构</div>", unsafe_allow_html=True)
         for tech in TECH_STACK:
@@ -473,9 +549,8 @@ def render_main_interface():
             """, unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # --- 中间：核心交互区 ---
+    # --- 中间：核心交互区 (高亮) ---
     with col_center:
-        # 聊天历史与输入
         st.markdown("<div class='chat-section'>", unsafe_allow_html=True)
         st.markdown("<div class='chat-history'>", unsafe_allow_html=True)
         
@@ -619,19 +694,13 @@ def render_main_interface():
                         if not is_home:
                             home_node_id = param_config.get('home_node_id')
                             home_node_title = next((n['title'] for n in PIPELINE_NODES if n['id'] == home_node_id), "未知节点")
-                            ref_style = "color: #d84315; background: #fff3e0; border-color: #ffccbc;" if is_bottleneck_node else ""
+                            ref_style = "color: #ef9a9a; background: #fff5f5; border-color: #ffcdd2;" if is_bottleneck_node else ""
                             st.markdown(f'<div class="param-ref-tag" style="{ref_style}">受 {home_node_title} 影响</div>', unsafe_allow_html=True)
 
-        # ==========================================
-        # 参数映射指南 (最终修复：无注释 + dedent)
-        # ==========================================
+        # 参数映射指南
         with st.expander("参数映射指南", expanded=False, key="guide_expander"):
             st.markdown("了解每个参数如何影响检索与生成的全过程。")
             
-                # 关键点：
-            # 1. 使用 textwrap.dedent 去除 Python 缩进带来的空格
-            # 2. 三引号紧接 f"""，后面紧跟 <div，中间不要有空行
-            # 3. 移除了所有 <!-- --> 注释，防止解析歧义
             guide_html = textwrap.dedent(f"""<div style="display: flex; gap: 20px; flex-wrap: wrap; margin-top: 15px;">
                 <div style="flex: 1; min-width: 250px; background: #f8f9fa; padding: 15px; border-radius: 8px; border: 1px solid #e0e0e0;">
                     <div style="font-weight:bold; color:#5d4037; margin-bottom:10px; border-bottom:2px solid #d7ccc8; padding-bottom:5px; font-size:1.0rem;">📥 数据获取端</div>
@@ -682,7 +751,7 @@ def render_main_interface():
             st.markdown(guide_html, unsafe_allow_html=True)
             
 
-    # --- 右侧：证据溯源 ---
+    # --- 右侧：证据溯源 (已淡化) ---
     with col_right:
         st.markdown("<div class='sidebar-panel'>", unsafe_allow_html=True)
         
@@ -696,17 +765,14 @@ def render_main_interface():
                 badge = "<span class='badge-cited'>✓ 引用</span>" if item.get("is_cited") else "<span class='badge-uncited'>参考</span>"
                 chapter = item.get('chapter', '未知')
                 content = item.get('content', '')
-                # ✅ 新增：获取摘要
                 summary = item.get('summary', '')
                 
-                # ✅ 新增：如果有摘要，构造带摘要的 HTML
-                # ✅ 修复：将定义好的 summary_html 实际插入到模板中
-                summary_html = f'<div style="font-size:0.75rem; color:#d84315; font-weight:bold; margin-bottom:4px;">📝 {summary}</div>' if summary else ''
+                summary_html = f'<div style="font-size:0.75rem; color:#d84315; font-weight:bold; margin-bottom:4px; opacity: 0.9;">📝 {summary}</div>' if summary else ''
                 
                 st.markdown(f"""
                 <div class="{css_class}">
                     <div class="evidence-meta"><span>📖 {chapter}</span>{badge}</div>
-                    {summary_html}  <!-- ✅ 这里插入了摘要 -->
+                    {summary_html}
                     <div class="evidence-text">{content}</div>
                 </div>
                 """, unsafe_allow_html=True)
