@@ -2,9 +2,8 @@ import os
 import json
 import logging
 import re
-import jieba
 import time
-from typing import List, Dict, Any, Optional, Tuple, Set
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -152,7 +151,7 @@ class SimpleEnsembleRetriever(BaseRetriever):
         return [item["doc"] for item in sorted_items[:top_k]]
 
 # ==========================================
-# 核心引擎：RAGEngine (Self-RAG 优化版)
+# 核心引擎：RAGEngine (✅ 修复版：回归分数优先策略)
 # ==========================================
 class RAGEngine:
     PROMPT_REWRITE_EXAMPLES = """
@@ -163,33 +162,6 @@ class RAGEngine:
     用户："丁元英为什么那么厉害？"
     重写：丁元英在《遥远的救世主》中展现出的超凡认知能力来源，他对"文化属性"规律的掌握，以及他如何利用这些规律在商战和人性博弈中取胜的具体案例分析。
     """
-
-    PROMPT_EVALUATE_TEMPLATE = (
-        "你是一个严格的评估助手。请判断给定的【文档片段】是否包含与【用户问题】相关的**实质性内容**。\n"
-        "用户问题：{question}\n"
-        "文档片段 (Top 1): {doc_content}...\n"
-        "如果片段与问题相关（哪怕只是部分相关），输出 'YES'。\n"
-        "如果片段完全无关，输出 'NO'。\n"
-        "只输出 YES 或 NO。"
-    )
-
-    PROMPT_GENERATION_TEMPLATE = """
-# Role: 严谨的《遥远的救世主》研究专家
-你的任务是基于【参考上下文】回答用户问题。你必须像律师举证一样，**每一句论点都必须有原文依据**。
-
-## ⚠️ 铁律 (违反任意一条即视为任务失败)
-1. **强制引用机制**: 每一个分论点、事实陈述后必须紧跟 ` [依据 X]` (注意空格)。
-2. **上下文索引映射**: 只能使用提供的 `[依据 1]`, `[依据 2]`... 标签。
-3. **结构化输出**: 使用 `###` 标题，`####` 分论点。
-
-## 参考上下文
-{context}
-
-## 用户问题
-{question}
-
-## 你的回答 (开始执行，记得每句话都要带引用):
-"""
 
     def __init__(self, 
                  txt_path: str, 
@@ -220,10 +192,10 @@ class RAGEngine:
         
         # 默认参数 (允许前端覆盖)
         self.default_params = {
-            "top_k_initial": 8,      # 平衡点
+            "top_k_initial": 8,      
             "top_k_final": 3,
-            "max_self_rag_attempts": 1, # 允许重试1次 (共2轮)
-            "multi_query_count": 1,
+            "max_self_rag_attempts": 0, # ✅ 建议默认改为 0，减少重试开销
+            "multi_query_count": 0,     # ✅ 建议默认改为 0，减少并发开销
             "rerank_threshold": 0.5
         }
 
@@ -252,7 +224,7 @@ class RAGEngine:
             self.reranker = None
 
         logger.info(f"正在加载主模型：{llm_name} ...")
-        self.llm = OllamaLLM(model=llm_name, temperature=0.3, request_timeout=120, num_predict=2048)
+        self.llm = OllamaLLM(model=llm_name, temperature=0.35, request_timeout=120, num_predict=2048)
         
         self.eval_llm = self.llm
         if eval_llm_name and eval_llm_name != llm_name:
@@ -396,7 +368,7 @@ class RAGEngine:
             logger.error(f"❌ 日志记录失败：{e}")
 
     # ==========================================
-    # 核心逻辑方法 (Self-RAG 优化版)
+    # 核心逻辑方法
     # ==========================================
     
     def _rewrite_query(self, question: str, history_context: str = "", mode: str = "deep") -> str:
@@ -502,129 +474,90 @@ class RAGEngine:
         return "\n\n---\n\n".join(context_evidence)
 
     def _generate_response_stream(self, context_text, question):
-        prompt_text = self.PROMPT_GENERATION_TEMPLATE.format(context=context_text, question=question)
+        # ✅ 新版 Prompt：兼顾“丁元英式干练”与“文雅排版”
+        prompt_template = """
+# Role: 《遥远的救世主》资深研究专家
+你兼具丁元英的**洞察力**与学者的**文雅**。请基于【参考上下文】回答用户问题。
+
+## ⚡ 核心原则
+1. **直击本质**：开篇第一句直接给出核心结论。**严禁**铺垫、寒暄、重复问题或使用“根据上下文”、“综上所述”等废话。
+2. **文雅排版**：
+   - 关键概念、金句必须 **加粗**。
+   - 引用原文必须使用 > 引用块 格式，并在末尾标注章节，如：`—— [第X章]`。
+   - 多点论述使用简洁的无序列表 (-)，每项尽量简短有力。
+3. **严谨举证**：所有观点必须源自上下文。若需引用特定片段，可在句末自然标注 `(见依据 X)`，但不要破坏句子流畅性。
+4. **极简主义**：能用一句话说清的，绝不用两段。拒绝车轱辘话。
+
+## 参考上下文
+{context}
+
+## 用户问题
+{question}
+
+## 你的回答 (立即开始，注意排版美观):
+"""
+        prompt_text = prompt_template.format(context=context_text, question=question)
+        
+        # 初始化收集器
         collector = StreamingResponseCollector(self.llm, prompt_text)
+        
+        # 返回收集器和生成器
         return collector, collector.generate(question)
 
     # ==========================================
-    # 新增：无模型快速过滤器 (Model-Free Fast Filter)
+    # ✅ 核心修复：回归“分数优先”的快速评估逻辑
     # ==========================================
-    def _fast_keyword_filter(self, question: str, docs: List[Document]) -> Optional[bool]:
-        """
-        基于关键词匹配分数的快速预评估。
-        返回 True (直接通过), False (直接失败), 或 None (需要 LLM 进一步评估)。
-        """
-        if not docs:
-            return False
-        
-        # 尝试导入 jieba，如果没有安装则直接跳过此优化，降级为 LLM 评估
-        try:
-            import jieba
-        except ImportError:
-            logger.warning("⚠️ 未安装 jieba 库，跳过关键词快速过滤，直接使用 LLM 评估。请运行: pip install jieba")
-            return None
-
-        try:
-            # 简单分词，去除停用词
-            stop_words = {"的", "了", "是", "在", "就", "都", "而", "及", "与", "着", "吗", "呢", "吧", "啊", "呀", "什么", "为什么", "如何"}
-            # 使用 lcut 进行分词
-            keywords = [w for w in jieba.lcut(question) if len(w) > 1 and w not in stop_words]
-            
-            if not keywords:
-                return None # 没有有效关键词，交给 LLM
-                
-            top_doc_content = docs[0].page_content.lower()
-            match_count = sum(1 for k in keywords if k in top_doc_content)
-            match_ratio = match_count / len(keywords)
-            
-            # 策略：
-            # 1. 如果超过 60% 的关键词都命中 -> 极大概率相关 -> 直接通过 (节省 LLM 调用)
-            if match_ratio >= 0.6:
-                logger.debug(f"⚡ [快速过滤] 关键词命中率 {match_ratio:.2f}，直接通过。")
-                return True
-            
-            # 2. 如果一个关键词都没命中 -> 极大概率无关 -> 直接失败 (触发重试)
-            if match_ratio == 0.0:
-                logger.debug(f"⚡ [快速过滤] 关键词命中率 0，直接拒绝。")
-                return False
-                
-            # 3. 否则 -> 模糊地带 -> 需要 LLM 评估
-            return None
-        except Exception as e:
-            logger.warning(f"⚠️ 关键词过滤执行出错 ({e})，降级为 LLM 评估。")
-            return None
-
-    # ==========================================
-    # 优化：带 CoT 的评估逻辑
-    # ==========================================
-    PROMPT_EVALUATE_COT_TEMPLATE = (
-        "你是一个严格的《遥远的救世主》研究助手。请判断【文档片段】是否包含回答【用户问题】所需的**实质性内容**。\n\n"
-        "## 用户问题\n{question}\n\n"
-        "## 文档片段 (Top 1)\n{doc_content}\n\n"
-        "## 任务要求\n"
-        "1. **分析**：首先思考文档中是否出现了问题中的关键实体、概念或情节？文档是否在讨论相关问题？\n"
-        "2. **判断**：只要文档对回答问题有**任何帮助**（哪怕只是提到概念），就视为相关。\n"
-        "3. **输出格式**：必须严格遵循以下 XML 格式，不要输出其他多余内容。\n"
-        "<reasoning>简要分析关键词匹配情况和语义相关性...</reasoning>\n"
-        "<decision>YES</decision> 或 <decision>NO</decision>\n\n"
-        "## 开始评估："
-    )
-
     def _evaluate_retrieval_quality(self, question: str, docs: List[Document]) -> bool:
         """
-        ✅ 优化版：混合过滤策略
-        1. 先尝试无模型关键词过滤 (提速)。
-        2. 若模糊，再调用小模型进行 CoT 评估 (提准)。
+        ✅ 修复版：模仿快版本逻辑。
+        1. 优先看 Rerank 分数：高分直接过，低分直接弃。
+        2. 仅在分数模糊时调用小模型，且不再使用 jieba 关键词过滤。
+        3. 避免频繁的重试触发。
         """
         if not docs:
             return False
         
-        # 步骤 1: 无模型快速过滤
-        fast_result = self._fast_keyword_filter(question, docs)
-        if fast_result is not None:
-            # 记录日志以便监控跳过了多少次 LLM 调用
-            logger.info(f"🛡️ [自检] 快速过滤结果：{'通过' if fast_result else '失败'} (跳过 LLM 评估)")
-            return fast_result
-        
-        # 步骤 2: LLM CoT 评估 (仅在模糊时调用)
         top_doc = docs[0]
-        prompt = self.PROMPT_EVALUATE_COT_TEMPLATE.format(
-            question=question,
-            doc_content=top_doc.page_content[:600] # 稍微多给一点上下文供推理
+        top_score = top_doc.metadata.get('rerank_score', 0)
+
+        # 1. 高分直接通过 (> 0.85) - 毫秒级完成
+        if top_score > 0.85:
+            logger.info(f"✅ [快模式] Rerank 高分 ({top_score:.2f}) 直接通过评估。")
+            return True
+        
+        # 2. 低分直接失败 (< 0.5) - 毫秒级完成
+        if top_score < 0.5:
+            logger.warning(f"⚠️ [快模式] Rerank 低分 ({top_score:.2f}) 直接判定失败。")
+            return False
+        
+        # 3. 中等分数 (0.5 - 0.85) - 才调用小模型辅助评估
+        logger.info(f"🤔 [快模式] Rerank 分数 ({top_score:.2f}) 中等，启动小模型辅助评估...")
+        
+        prompt = (
+            f"你是一个严格的评估助手。请判断给定的【文档片段】是否包含与【用户问题】相关的**实质性内容**。\n"
+            f"用户问题：{question}\n"
+            f"文档片段 (Top 1): {top_doc.page_content[:300]}...\n"
+            f"如果片段与问题相关（哪怕只是部分相关），输出 'YES'。\n"
+            f"如果片段完全无关，输出 'NO'。\n"
+            f"只输出 YES 或 NO。"
         )
         
         try:
-            logger.info("🧠 [自检] 进入 CoT 深度评估模式...")
-            response = self.eval_llm.invoke(prompt).strip()
+            resp = self.eval_llm.invoke(prompt).strip().upper()
             
-            # 解析 CoT 结果
-            decision = "NO" # 默认失败
-            if "<decision>" in response:
-                decision_content = response.split("<decision>", 1)[1].split("</decision>", 1)[0].strip().upper()
-                if "YES" in decision_content:
-                    decision = "YES"
-                elif "NO" in decision_content:
-                    decision = "NO"
-            elif "YES" in response.upper():
-                # 兜底：如果没有标签但包含了 YES
-                decision = "YES"
-            
-            is_relevant = (decision == "YES")
-            logger.info(f"🛡️ [自检] CoT 评估结论：{'通过' if is_relevant else '失败'}")
-            # 可选：打印 reasoning 用于调试
-            # if "<reasoning>" in response:
-            #     reason = response.split("<reasoning>", 1)[1].split("</reasoning>", 1)[0]
-            #     logger.debug(f"   推理过程：{reason}")
-            
-            return is_relevant
-            
+            if 'NO' in resp:
+                logger.warning("⚠️ 评估模型判定不相关，触发重试。")
+                return False
+            else:
+                logger.info("✅ 评估模型判定相关。")
+                return True
+                
         except Exception as e:
-            logger.warning(f"评估模型调用失败，保守策略：默认通过。错误：{e}")
+            logger.error(f"评估模型调用失败：{e}，保守起见返回 True。")
             return True
 
-
     def _post_process_response(self, full_response, context_text, question, timer):
-        """✅ 优化点：移除耗时的同步 LLM 重写，仅做标记"""
+        """后处理：统计引用"""
         def count_citations(text: str):
             indices = set()
             pattern = r'[\[\(【](?:依据 | 参考)?\s*:?\s*(\d+)[\]\)】]'
@@ -642,7 +575,6 @@ class RAGEngine:
         
         if needs_retry:
             logger.warning("⚠️ [自检警告] 生成结果缺少引用。为避免延迟，跳过 LLM 重写步骤，仅添加系统注记。")
-            # 不再调用 LLM 重写，直接加注记
             full_response += "\n\n> ⚠️ **系统注**: 本次回答未能自动标注原文引用，请人工核对上下文。"
         
         for item in self.last_retrieval_debug_info:
@@ -653,18 +585,14 @@ class RAGEngine:
 
     def query(self, question: str, **kwargs):
         """
-        主查询入口 (Self-RAG 优化版)
-        逻辑：
-        1. 尝试检索 -> 评估。
-        2. 若失败且还有重试次数 -> 降级重试 (单路 + 放宽 TopK)。
-        3. 生成 -> 后处理 (仅标记，不重试生成)。
+        主查询入口 (✅ 修复版)
         """
         params = {**self.default_params, **kwargs}
         rewrite_mode = params.get('rewrite_mode', 'deep')
         top_k_initial = params['top_k_initial']
         top_k_final = params['top_k_final']
         multi_query_count = params['multi_query_count']
-        max_attempts = params.get('max_self_rag_attempts', 1)
+        max_attempts = params.get('max_self_rag_attempts', 0) # 默认 0
 
         logger.info(f"🎛️ [本次配置] K_init={top_k_initial}, Mode={rewrite_mode}, Max_Retry={max_attempts}")
 
@@ -687,12 +615,10 @@ class RAGEngine:
             logger.info(f"🔄 [尝试 {attempt + 1}/{max_attempts + 1}] {'(降级重试)' if is_retry else '(初始检索)'}")
             
             try:
-                # 1. 准备查询 (重试时简化逻辑)
+                # 1. 准备查询
                 if is_retry:
-                    # ✅ 智能降级：重试时不再生成多路查询，直接使用原问题，避免耗时翻倍
                     current_queries = [question]
                     logger.info("⚡ [降级策略] 重试模式：禁用多路查询，直接使用原问题。")
-                    # 可选：重试时稍微放宽一点初始召回数量，增加命中率
                     current_top_k = min(int(top_k_initial * 1.5), 20) 
                 else:
                     rewritten_query = self._rewrite_query(question, mode=rewrite_mode) 
@@ -743,7 +669,7 @@ class RAGEngine:
                 else:
                     final_docs = []
                 
-                # 4. 评估 (Self-RAG 核心)
+                # 4. 评估 (✅ 使用修复后的快速评估)
                 if final_docs:
                     success_eval = self._evaluate_retrieval_quality(question, final_docs)
                     timer.checkpoint("Eval_Phase")
@@ -751,8 +677,8 @@ class RAGEngine:
                     if not success_eval and attempt < max_attempts:
                         logger.warning("❌ 评估未通过，准备重试...")
                         attempt += 1
-                        retry_overhead_seconds += timer.get_total_time() - sum(timer.get_stages().values()) # 粗略估算
-                        continue # 进入下一轮循环
+                        retry_overhead_seconds += timer.get_total_time() - sum(timer.get_stages().values())
+                        continue
                     elif not success_eval:
                         logger.warning("❌ 评估未通过且已达最大重试次数，强制继续生成。")
                 else:
@@ -770,7 +696,7 @@ class RAGEngine:
                 final_docs = []
                 break
             
-            break # 成功或放弃，退出循环
+            break 
 
         timer.checkpoint("Retrieval_Phase_Done")
         
@@ -784,12 +710,11 @@ class RAGEngine:
             self._log_interaction(question, "", self.metrics)
             return
 
-        # 5. 构建上下文 (使用批量 Embedding)
+        # 5. 构建上下文
         context_text = self._build_context_and_metrics(final_docs, question, timer)
         
         # 6. LLM 生成
         logger.info("📝 开始生成并自我反思...")
-        yield "💡 正在深度推演...\n\n"
         
         full_response = ""
         try:
@@ -808,7 +733,7 @@ class RAGEngine:
 
         timer.checkpoint("LLM_Generation")
         
-        # 7. 后处理 (仅检查，不重试生成)
+        # 7. 后处理
         full_response, cited_count, cited_indices, needs_retry = self._post_process_response(full_response, context_text, question, timer)
         
         # 8. 组装 Metrics
@@ -827,7 +752,7 @@ class RAGEngine:
         self.metrics = {
             "status": "success", "latency_seconds": round(total_latency, 2),
             "stage_durations": current_stages, 
-            "active_params": params,  # 这里的 params 是 query 方法入口处合并了默认值和 kwargs 后的最终字典
+            "active_params": params,
             "retrieval_latency": round(current_stages.get("Retrieval_Phase_Done", 0), 2),
             "generation_latency": round(current_stages.get("LLM_Generation", 0), 2),
             "total_retrieved": total_retrieved,
