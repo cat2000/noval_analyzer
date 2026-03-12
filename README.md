@@ -69,27 +69,20 @@ ollama pull qwen3
 ollama pull qwen3:0.6b  # 用于快速评估的小模型
 ```
 
-### 2. 创建 Python 虚拟环境
+### 2. 创建python虚拟环境
 
 ```bash
-# 创建 python 虚拟环境 (Mac/Linux 示例)
-python3.11 -m venv .venv
-
-# 激活虚拟环境
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-
-# 安装依赖 (请确保目录下有 requirements.txt，若无需手动安装以下库)
-pip install streamlit langchain langchain-community langchain-ollama langchain-huggingface sentence-transformers scikit-learn chromadb
+# 创建python虚拟环境
+/opt/homebrew/bin/python3.11 -m venv .venv
 ```
 
-### 3. 准备数据与启动
-
-确保当前目录下存在 `遥远的救世主.txt` 文件。
+### 3. 修改启动文件
 
 ```bash
-# 直接运行 Streamlit 应用
-streamlit run app.py
+# 授权启动文件可双击执行。
+chmod +x 启动专家系统.command
 ```
+*双击运行文件： 启动专家系统.command*
 
 *首次启动时，系统会自动构建 Parent-Child 向量索引。由于涉及 LLM 生成摘要，可能需要几分钟时间。系统支持断点续传，中途关闭后再次启动会自动从上次进度继续。*
 
