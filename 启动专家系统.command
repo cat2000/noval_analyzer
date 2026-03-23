@@ -33,11 +33,13 @@ if [[ "$CURRENT_PYTHON" != *".venv"* ]]; then
 fi
 
 # 2. 安装依赖 (静默模式)
-echo "📦 检查并升级依赖库..."
-pip install --quiet --upgrade pip
+# [修改] 去掉了 --upgrade 参数，如果包已存在则直接跳过，大幅加快速度
+echo "📦 检查并安装缺失依赖库..."
+pip install --quiet pip
 
 # ✅ [修改] 添加了 jieba 用于关键词快速过滤
-pip install --upgrade --quiet \
+# 注意：去掉了 --upgrade，只有缺失时才会安装
+pip install --quiet \
     "langchain>=0.3.0" "langchain-core>=0.3.0" "langchain-community>=0.3.0" \
     "langchain-text-splitters" "langchain-ollama" "langchain-huggingface" \
     "chromadb" "streamlit" "sentence-transformers>=0.29.0" "scikit-learn" \
@@ -93,6 +95,28 @@ echo "   - 分词工具      : jieba (关键词预检)"
 echo "----------------------------------------"
 
 URL="http://localhost:8501"
+
+# [新增] 检查是否已经运行，如果已运行则直接跳过启动
+if curl -s $URL &> /dev/null; then
+    echo "✅ 检测到服务已在运行 ($URL)，跳过启动步骤。"
+    echo "🌐 正在打开浏览器..."
+    
+    if command -v open &> /dev/null; then
+        open "$URL"
+    elif command -v xdg-open &> /dev/null; then
+        xdg-open "$URL"
+    elif command -v start &> /dev/null; then
+        start "$URL"
+    else
+        echo "💡 请手动在浏览器访问: $URL"
+    fi
+    echo ""
+    echo "✅ 系统运行中。按 Ctrl+C 退出脚本 (服务将在后台继续运行)。"
+    # 捕获 Ctrl+C 以提示
+    trap "echo ''; echo '🛑 脚本已停止 (服务仍在后台运行)。'; exit" INT TERM
+    wait
+    exit 0
+fi
 
 # 启动命令
 STREAMLIT_CMD="streamlit run app.py --server.headless true --server.address localhost --server.port 8501"
